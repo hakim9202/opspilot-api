@@ -1,0 +1,114 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Lab/commercial org with a plan entitlement (no real billing yet).
+model Organization {
+  id          String         @id @default(cuid())
+  name        String
+  slug        String         @unique
+  /// free | team | enterprise
+  plan        String         @default("free")
+  /// -1 means unlimited
+  maxClusters Int            @default(1)
+  status      String         @default("active")
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  installTokens InstallToken[]
+}
+
+model InstallToken {
+  id             String        @id @default(cuid())
+  token          String        @unique
+  label          String
+  active         Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  agents         Agent[]
+}
+
+model Agent {
+  id             String        @id @default(cuid())
+  hostname       String
+  environment    String
+  clusterName    String
+  version        String
+  accessToken    String        @unique
+  status         String        @default("registered")
+  labels         Json?
+  lastHeartbeatAt DateTime?
+  revokedAt      DateTime?
+  /// Latest monitored pod inventory from agent heartbeats.
+  podInventory   Json?
+  podInventoryAt DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  installTokenId String?
+  installToken   InstallToken? @relation(fields: [installTokenId], references: [id])
+  incidents      Incident[]
+  fixCommands    AgentFixCommand[]
+
+  @@index([clusterName])
+}
+
+/// Customer-defined redaction regex patterns pushed to agents on heartbeat/config.
+model RedactionPattern {
+  id        String   @id @default(cuid())
+  pattern   String
+  label     String?
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model Incident {
+  id           String   @id @default(cuid())
+  agentId      String
+  agent        Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  type         String
+  severity     String
+  title        String
+  message      String
+  namespace    String?
+  resource     String?
+  reason       String?
+  occurredAt   DateTime
+  labels       Json?
+  metadata     Json?
+  /// Frozen evidence pack captured at detection time (redacted).
+  snapshot     Json?
+  suggestedFix String?
+  createdAt    DateTime @default(now())
+  fixCommands  AgentFixCommand[]
+
+  @@index([agentId, createdAt])
+  @@index([type, createdAt])
+}
+
+/// User-confirmed remediation for the in-cluster agent to apply (allowlisted ops only).
+model AgentFixCommand {
+  id          String    @id @default(cuid())
+  agentId     String
+  agent       Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  incidentId  String?
+  incident    Incident? @relation(fields: [incidentId], references: [id], onDelete: SetNull)
+  /// set_deployment_memory | set_deployment_image
+  type        String
+  params      Json
+  /// pending | claimed | succeeded | failed | cancelled
+  status      String    @default("pending")
+  result      String?
+  error       String?
+  claimedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([agentId, status])
+  @@index([incidentId])
+}

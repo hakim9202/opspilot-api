@@ -11,10 +11,17 @@ export type InventoryPod = {
   status?: string;
 };
 
+export type InventoryContainer = {
+  name?: string;
+  status?: string;
+  health?: string;
+};
+
 export type AgentInventory = {
   clusterName: string;
   status?: string;
   podInventory?: unknown;
+  containerInventory?: unknown;
 };
 
 /** Incident types that count as active failures on the main board. */
@@ -24,6 +31,24 @@ export const DASHBOARD_FAILURE_TYPES = new Set([
   'OOMKilled',
   'DeploymentUnhealthy',
   'KubernetesWarning',
+  'CreateContainerConfigError',
+  'CreateContainerError',
+  'InvalidImageName',
+]);
+
+/** Docker-host incident types shown on the dashboard. */
+export const DOCKER_DASHBOARD_FAILURE_TYPES = new Set([
+  'ContainerExited',
+  'ContainerUnhealthy',
+  'ContainerRestartLoop',
+  'ContainerOOMKilled',
+]);
+
+const HEALTHY_CONTAINER_STATUSES = new Set([
+  'running',
+  'created',
+  'paused',
+  'removing',
 ]);
 
 const HEALTHY_STATUSES = new Set([
@@ -47,6 +72,22 @@ export function isKnownFailurePodStatus(status?: string | null): boolean {
 
 function parsePods(raw: unknown): InventoryPod[] {
   return Array.isArray(raw) ? (raw as InventoryPod[]) : [];
+}
+
+function parseContainers(raw: unknown): InventoryContainer[] {
+  return Array.isArray(raw) ? (raw as InventoryContainer[]) : [];
+}
+
+/** True when container inventory status indicates an active failure. */
+export function isKnownFailureContainerStatus(
+  status?: string | null,
+  health?: string | null,
+): boolean {
+  const h = (health || '').trim().toLowerCase();
+  if (h === 'unhealthy') return true;
+  const s = (status || '').trim().toLowerCase();
+  if (!s || HEALTHY_CONTAINER_STATUSES.has(s)) return false;
+  return /exited|dead|restarting|unhealthy|oom/.test(s);
 }
 
 export type LiveFailureIndex = {
@@ -122,5 +163,47 @@ export function filterLiveFailureIncidents(
     }
     // Other kinds (ReplicaSet, etc.): match if name equals a failing pod.
     return index.failingPods.has(key(cluster, ns, name));
+  });
+}
+
+function containerKey(cluster: string, name: string): string {
+  return `${cluster}|${name}`;
+}
+
+export function buildLiveDockerFailureIndex(
+  agents: AgentInventory[],
+): Set<string> {
+  const failing = new Set<string>();
+  for (const agent of agents) {
+    if (agent.status === 'revoked') continue;
+    const cluster = agent.clusterName || '';
+    for (const c of parseContainers(agent.containerInventory)) {
+      const name = (c.name || '').trim();
+      if (!name) continue;
+      if (!isKnownFailureContainerStatus(c.status, c.health)) continue;
+      failing.add(containerKey(cluster, name));
+    }
+  }
+  return failing;
+}
+
+/**
+ * Keep docker failure incidents tied to containers that still exist and are
+ * failing in the latest container inventory.
+ */
+export function filterLiveDockerFailureIncidents(
+  incidents: IncidentLike[],
+  agents: AgentInventory[],
+): IncidentLike[] {
+  const failing = buildLiveDockerFailureIndex(agents);
+  if (failing.size === 0) return [];
+
+  return incidents.filter((i) => {
+    if (!DOCKER_DASHBOARD_FAILURE_TYPES.has(i.type)) return false;
+    const cluster = i.agent?.clusterName || '';
+    if (!cluster) return false;
+    const { kind, name } = resourceKindName(i.resource);
+    if (kind !== 'container' || !name) return false;
+    return failing.has(containerKey(cluster, name));
   });
 }

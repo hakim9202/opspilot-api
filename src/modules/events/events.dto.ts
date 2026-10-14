@@ -3,6 +3,9 @@ export class EventDto {
   severity!: string;
   title!: string;
   message!: string;
+  source?: string;
+  service?: string;
+  host?: string;
   namespace?: string;
   resource?: string;
   reason?: string;

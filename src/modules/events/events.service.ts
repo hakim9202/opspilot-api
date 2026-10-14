@@ -45,6 +45,10 @@ export class EventsService {
         );
       }
       const occurredAt = new Date(e.occurredAt);
+      const metadata = { ...(e.metadata ?? {}) } as Record<string, string>;
+      if (e.source) metadata.source = e.source;
+      if (e.service) metadata.service = e.service;
+      if (e.host) metadata.host = e.host;
       const snapshotRaw =
         e.snapshot && typeof e.snapshot === 'object'
           ? e.snapshot
@@ -54,9 +58,9 @@ export class EventsService {
               namespace: e.namespace,
               resource: e.resource,
               occurredAt,
-              metadata: e.metadata,
+              metadata,
             });
-      const snapshot = JSON.parse(JSON.stringify(snapshotRaw)) as Prisma.InputJsonValue;
+      const snapshot = this.sanitizeJson(snapshotRaw) as Prisma.InputJsonValue;
 
       const row = await this.prisma.incident.create({
         data: {
@@ -70,7 +74,7 @@ export class EventsService {
           reason: e.reason,
           occurredAt,
           labels: (e.labels ?? {}) as Prisma.InputJsonValue,
-          metadata: (e.metadata ?? {}) as Prisma.InputJsonValue,
+          metadata: metadata as Prisma.InputJsonValue,
           snapshot,
         },
       });
@@ -83,5 +87,13 @@ export class EventsService {
     });
 
     return { accepted: created.length };
+  }
+
+  /** Strip null bytes and normalize JSON for PostgreSQL text/json columns. */
+  private sanitizeJson(value: unknown): unknown {
+    const json = JSON.stringify(value, (_key, v) =>
+      typeof v === 'string' ? v.replace(/\u0000/g, '') : v,
+    );
+    return JSON.parse(json);
   }
 }

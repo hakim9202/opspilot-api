@@ -47,6 +47,9 @@ model Agent {
   /// Latest monitored pod inventory from agent heartbeats.
   podInventory   Json?
   podInventoryAt DateTime?
+  /// Latest monitored Docker container inventory (docker-host agents).
+  containerInventory   Json?
+  containerInventoryAt DateTime?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
   installTokenId String?

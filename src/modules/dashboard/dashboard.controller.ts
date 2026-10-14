@@ -7,14 +7,31 @@ import {
   Post,
   Query,
   Redirect,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { AgentsService } from '../agents/agents.service';
 import { IncidentsService } from '../incidents/incidents.service';
 import { LicensingService } from '../licensing/licensing.service';
 import { ClusterPrefillService } from '../incidents/cluster-prefill.service';
-import { groupIncidents } from '../incidents/incident-groups';
+import { AiSuggestionService } from '../incidents/ai-suggestion.service';
+import { groupIncidents, type IncidentGroup } from '../incidents/incident-groups';
 import { inferDeploymentFromPodName } from '../incidents/pod-history';
-import { filterLiveFailureIncidents } from '../incidents/live-failures';
+import { filterLiveFailureIncidents, filterLiveDockerFailureIncidents } from '../incidents/live-failures';
+import {
+  categoryTabLabel,
+  filterIncidentsByCategory,
+  inferIncidentCategory,
+  normalizeDashboardCategoryTab,
+  type DashboardCategoryTab,
+} from '../incidents/incident-category';
+import {
+  ASK_OPEN_PROMPT,
+  buildAskAgentSession,
+  isDockerContainerIncident,
+  parseAskOptionPayload,
+  resolveAskOptionParams,
+} from '../incidents/ask-agent';
 import {
   splitCommands,
   MEMORY_PRESETS,
@@ -38,11 +55,18 @@ export class DashboardController {
     private readonly incidentsService: IncidentsService,
     private readonly licensing: LicensingService,
     private readonly clusterPrefill: ClusterPrefillService,
+    private readonly aiSuggestions: AiSuggestionService,
   ) {}
 
   @Get()
   @Header('Content-Type', 'text/html; charset=utf-8')
-  async page() {
+  async page(
+    @Query('category') categoryParam?: string,
+    @Query('source') sourceParam?: string,
+  ) {
+    const activeCategory = normalizeDashboardCategoryTab(
+      categoryParam || sourceParam,
+    );
     const [agents, incidents] = await Promise.all([
       this.agentsService.listAgents(),
       this.incidentsService.list(200),
@@ -72,49 +96,56 @@ export class DashboardController {
       })
       .join('');
 
-    const liveIncidents = filterLiveFailureIncidents(incidents, agents);
+    const inventoryAgents = agents.map((a) => ({
+      clusterName: a.clusterName,
+      status: a.status,
+      podInventory: (a as { podInventory?: unknown }).podInventory,
+      containerInventory: (a as { containerInventory?: unknown }).containerInventory,
+    }));
+
+    const k8sLive = filterLiveFailureIncidents(incidents, inventoryAgents);
+    const dockerLive = filterLiveDockerFailureIncidents(incidents, inventoryAgents);
+    const allLive = [...k8sLive, ...dockerLive].sort(
+      (a, b) =>
+        new Date(b.occurredAt).getTime() - new Date(a.occurredAt).getTime(),
+    );
+
+    const tabCounts: Record<DashboardCategoryTab, number> = {
+      all: groupIncidents(allLive).length,
+      pod: groupIncidents(filterIncidentsByCategory(allLive, 'pod')).length,
+      deployment: groupIncidents(filterIncidentsByCategory(allLive, 'deployment'))
+        .length,
+      docker: groupIncidents(filterIncidentsByCategory(allLive, 'docker')).length,
+      replicaset: groupIncidents(filterIncidentsByCategory(allLive, 'replicaset'))
+        .length,
+      other: groupIncidents(filterIncidentsByCategory(allLive, 'other')).length,
+    };
+
+    const liveIncidents = filterIncidentsByCategory(allLive, activeCategory);
     const groups = groupIncidents(liveIncidents);
-    const incidentRows = groups
-      .map((g) => {
-        const i = g.latest;
-        const cause = formatCause(i.metadata, i.reason);
-        const fix = this.incidentsService.displaySuggestedFix(
-          i.suggestedFix,
-          i.severity,
-        );
-        const hasSnap = i.snapshot != null;
-        const action = this.incidentsService.suggestionAction(i);
-        let actionCell = '<span class="muted">—</span>';
-        if (action === 'apply') {
-          actionCell = `<a class="btn primary autofix-btn" href="/dashboard/incidents/${esc(i.id)}/apply-fix">Apply suggested fix</a>`;
-        } else if (action === 'view') {
-          actionCell = `<a class="btn autofix-btn" href="/dashboard/incidents/${esc(i.id)}/suggestion">View suggestion</a>`;
-        }
-        const countBadge =
-          g.count > 1
-            ? `<span class="badge off" title="Repeated detections of the same issue">×${g.count}</span>`
-            : `<span class="muted">1</span>`;
-        return `
-      <tr>
-        <td class="autofix-col">${actionCell}</td>
-        <td>${esc(g.lastSeenAt.toISOString())}</td>
-        <td>${countBadge}</td>
-        <td><span class="badge ${severityClass(i.severity)}">${esc(i.severity)}</span></td>
-        <td>${esc(g.type)}</td>
-        <td class="cause"><code>${esc(cause)}</code></td>
-        <td class="fix">${fix ? esc(fix) : '<span class="muted">—</span>'}</td>
-        <td><code>${esc(g.resource)}</code></td>
-        <td>${esc(g.namespace)}</td>
-        <td>${esc(g.clusterName)}</td>
-        <td><a href="/dashboard/incidents/${esc(i.id)}">${hasSnap ? 'Snapshot' : 'Detail'}</a></td>
-      </tr>`;
-      })
-      .join('');
+
+    const locationHeader =
+      activeCategory === 'docker'
+        ? 'Host'
+        : activeCategory === 'pod' ||
+            activeCategory === 'deployment' ||
+            activeCategory === 'replicaset'
+          ? 'Namespace'
+          : 'Namespace / Host';
+
+    const incidentRows = renderDashboardIncidentRows(groups, this.incidentsService);
+
+    const categoryTabs = renderCategoryTabs(activeCategory, tabCounts);
+    const categoryHint = dashboardCategoryHint(activeCategory);
+    const refreshUrl =
+      activeCategory === 'all'
+        ? '/dashboard'
+        : `/dashboard?category=${activeCategory}`;
 
     return layout(
-      'OpsPilot Dashboard',
+      'Pulse',
       'Connected agents and live failures · auto-refresh 15s',
-      true,
+      refreshUrl,
       `
     <section>
       <h2>Agents (${agents.length})</h2>
@@ -129,16 +160,17 @@ export class DashboardController {
     </section>
     <section>
       <h2>Incidents (${groups.length} live failures · ${liveIncidents.length} events)</h2>
-      <p class="muted">Only failures on pods that still exist in the latest agent inventory. Healthy / deleted pods and rollouts are hidden — open an agent → pod for full history.</p>
+      ${categoryTabs}
+      <p class="muted">${esc(categoryHint)}</p>
       ${
         groups.length
           ? `<table>
         <thead><tr>
-          <th>Fix</th><th>Last seen</th><th>Count</th><th>Severity</th><th>Type</th><th>Cause / Why</th><th>Suggested fix</th><th>Resource</th><th>Namespace</th><th>Cluster</th><th>Evidence</th>
+          <th>Fix</th><th>Last seen</th><th>Count</th><th>Severity</th><th>Type</th><th>Cause / Why</th><th>Suggested fix</th><th>Resource</th><th>${esc(locationHeader)}</th><th>Cluster</th><th>Evidence</th>
         </tr></thead>
         <tbody>${incidentRows}</tbody>
       </table>`
-          : `<p class="empty">No live failures. All inventoried pods look healthy (or break a demo pod to generate one).</p>`
+          : `<p class="empty">${esc(dashboardEmptyMessage(activeCategory))}</p>`
       }
     </section>`,
     );
@@ -150,7 +182,7 @@ export class DashboardController {
     const i = await this.incidentsService.getById(id);
     const action = this.incidentsService.suggestionAction(i);
     if (action === 'apply') {
-      return { url: `/dashboard/incidents/${id}/apply-fix`, statusCode: 302 };
+      return { url: `/dashboard/incidents/${id}?ask=1`, statusCode: 302 };
     }
     return { url: `/dashboard/incidents/${id}/suggestion`, statusCode: 302 };
   }
@@ -196,15 +228,15 @@ export class DashboardController {
     if (action === 'apply') {
       return layout(
         'View suggestion',
-        `${i.type} · advice view — use Apply suggested fix for dry-run / confirm`,
+        `${i.type} · advice view — use Ask Pulse to confirm and apply`,
         false,
         `
     <section>
       <p><a href="/dashboard">← Back to dashboard</a> · <a href="/dashboard/incidents/${esc(i.id)}">Incident detail</a></p>
       <h2>Suggested fix</h2>
       <p class="fix">${esc(fix)}</p>
-      <p><a class="btn primary" href="/dashboard/incidents/${esc(i.id)}/apply-fix">Apply suggested fix</a></p>
-      <p class="muted">This incident has a concrete remediating kubectl plan. Apply opens a dry-run preview and requires confirmation before unlock.</p>
+      <p>${askAgentButton(i.id)}</p>
+      <p class="muted">Chat through options, then confirm — the in-cluster agent applies the allowlisted fix.</p>
     </section>`,
       );
     }
@@ -252,9 +284,277 @@ export class DashboardController {
     };
   }
 
+  @Get('incidents/:id/ask-agent')
+  @Redirect()
+  async incidentAskAgent(
+    @Param('id') id: string,
+    @Query('queued') queued?: string,
+    @Query('error') error?: string,
+  ) {
+    const q = new URLSearchParams({ ask: '1' });
+    if (queued) q.set('queued', queued);
+    if (error) q.set('error', error);
+    return {
+      url: `/dashboard/incidents/${id}?${q.toString()}`,
+      statusCode: 302,
+    };
+  }
+
+  @Get('incidents/:id/ask-agent/session')
+  async incidentAskAgentSession(@Param('id') id: string) {
+    const i = await this.incidentsService.getById(id);
+    const target = resolveDeploymentTarget(i);
+    const docker = isDockerContainerIncident(i);
+    if (!target.deployment && !docker) {
+      return {
+        ok: false,
+        error: 'Pulse needs a Deployment or Docker container target for this incident.',
+      };
+    }
+    let prefill = resolveApplyPrefill(i);
+    if (target.deployment) {
+      const live = await this.clusterPrefill.sniffDeploymentContainer(
+        target.namespace,
+        target.deployment,
+        prefill.container || undefined,
+      );
+      if (live) {
+        prefill = mergeClusterPrefill(prefill, live);
+      }
+    }
+    const session = buildAskAgentSession(i, prefill);
+    const history = await this.incidentsService.listFixCommandsForIncident(id);
+    const subtitle = docker
+      ? `${session.type} · docker ${session.namespace}/${session.deployment}`
+      : `${session.type} · ${target.namespace}/${target.deployment || '—'}`;
+    return {
+      ok: true,
+      incidentId: id,
+      type: session.type,
+      namespace: session.namespace,
+      deployment: session.deployment,
+      platform: session.platform || 'kubernetes',
+      problem: session.problem,
+      opener: session.opener,
+      options: session.options,
+      subtitle,
+      poll: history.some(
+        (h) => h.status === 'pending' || h.status === 'claimed',
+      ),
+    };
+  }
+
+  @Post('incidents/:id/ask-agent/chat')
+  async incidentAskAgentChat(
+    @Param('id') id: string,
+    @Body()
+    body: {
+      message?: string;
+      history?: Array<{ role?: string; content?: string }>;
+    },
+  ) {
+    const prepared = await this.prepareAskChat(id, body);
+    if ('error' in prepared) return prepared;
+    const result = await this.aiSuggestions.chatAboutIncident(
+      prepared.session,
+      prepared.history,
+      prepared.message,
+    );
+    return { ok: true, ...result };
+  }
+
+  /** SSE stream of Cursor thinking / MCP tools / final reply. */
+  @Post('incidents/:id/ask-agent/chat-stream')
+  async incidentAskAgentChatStream(
+    @Param('id') id: string,
+    @Body()
+    body: {
+      message?: string;
+      history?: Array<{ role?: string; content?: string }>;
+    },
+    @Res() res: Response,
+  ) {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const write = (payload: unknown) => {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    let prepared: Awaited<ReturnType<DashboardController['prepareAskChat']>>;
+    try {
+      prepared = await this.prepareAskChat(id, body);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      write({ type: 'error', message: msg.slice(0, 300) });
+      res.end();
+      return;
+    }
+    if ('error' in prepared) {
+      write({ type: 'error', message: prepared.error });
+      res.end();
+      return;
+    }
+
+    try {
+      for await (const ev of this.aiSuggestions.streamChatAboutIncident(
+        prepared.session,
+        prepared.history,
+        prepared.message,
+      )) {
+        write(ev);
+        const flushable = res as unknown as { flush?: () => void };
+        flushable.flush?.();
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      write({ type: 'error', message: msg.slice(0, 300) });
+    }
+    res.end();
+  }
+
+  private async prepareAskChat(
+    id: string,
+    body: {
+      message?: string;
+      history?: Array<{ role?: string; content?: string }>;
+    },
+  ) {
+    const i = await this.incidentsService.getById(id);
+    let prefill = resolveApplyPrefill(i);
+    const target = resolveDeploymentTarget(i);
+    if (target.deployment) {
+      const live = await this.clusterPrefill.sniffDeploymentContainer(
+        target.namespace,
+        target.deployment,
+        prefill.container || undefined,
+      );
+      if (live) {
+        prefill = mergeClusterPrefill(prefill, live);
+      }
+    }
+    const session = buildAskAgentSession(i, prefill);
+    session.incidentId = id;
+    session.agentId = i.agent?.id;
+    const message = (body.message || '').trim();
+    if (!message) {
+      return { ok: false as const, error: 'Message is required' };
+    }
+    const history = (body.history || [])
+      .filter(
+        (m) =>
+          (m.role === 'user' || m.role === 'assistant') &&
+          typeof m.content === 'string' &&
+          m.content.trim(),
+      )
+      .slice(-12)
+      .map((m) => ({
+        role: m.role as 'user' | 'assistant',
+        content: String(m.content).slice(0, 2000),
+      }));
+    return { session, history, message };
+  }
+
+  @Post('incidents/:id/ask-agent/apply')
+  async incidentAskAgentApply(
+    @Param('id') id: string,
+    @Body()
+    body: {
+      optionId?: string;
+      userInput?: string;
+      option?: {
+        action?: string;
+        label?: string;
+        detail?: string;
+        image?: string;
+        memoryLimit?: string;
+        replicas?: string;
+        needsInput?: boolean | string;
+        params?: Record<string, string>;
+      };
+    },
+  ) {
+    const i = await this.incidentsService.getById(id);
+    const target = resolveDeploymentTarget(i);
+    const docker = isDockerContainerIncident(i);
+    if (!target.deployment && !docker) {
+      return { ok: false, error: 'Incident is not eligible for apply' };
+    }
+    let prefill = resolveApplyPrefill(i);
+    if (target.deployment) {
+      const live = await this.clusterPrefill.sniffDeploymentContainer(
+        target.namespace,
+        target.deployment,
+        prefill.container || undefined,
+      );
+      if (live) {
+        prefill = mergeClusterPrefill(prefill, live);
+      }
+    }
+    try {
+      const opt = parseAskOptionPayload(
+        {
+          option: body.option as Record<string, unknown> | undefined,
+          optionId: body.optionId,
+        },
+        [],
+        prefill,
+      );
+      const params = resolveAskOptionParams(opt, body.userInput);
+      const cmd = await this.incidentsService.enqueueAgentFix(id, {
+        acknowledge: params.acknowledge,
+        container: params.container,
+        memoryLimit: params.memoryLimit,
+        memoryRequest: params.memoryRequest,
+        image: params.image,
+        deployAction: params.deployAction,
+        replicas: params.replicas,
+      });
+      return {
+        ok: true,
+        commandId: cmd.id,
+        type: cmd.type,
+        status: cmd.status,
+        summary: opt.detail || opt.label || 'Fix queued',
+      };
+    } catch (err: any) {
+      const msg = Array.isArray(err?.response?.message)
+        ? err.response.message.join(', ')
+        : err?.response?.message || err?.message || 'Failed to queue fix';
+      return { ok: false, error: String(msg) };
+    }
+  }
+
   @Get('incidents/:id/apply-fix')
+  @Redirect()
+  async incidentApplyFixRedirect(
+    @Param('id') id: string,
+    @Query('queued') queued?: string,
+    @Query('error') error?: string,
+    @Query('advanced') advanced?: string,
+  ) {
+    if (advanced === '1') {
+      return {
+        url: `/dashboard/incidents/${id}/apply-fix/advanced`,
+        statusCode: 302,
+      };
+    }
+    const q = new URLSearchParams();
+    if (queued) q.set('queued', queued);
+    if (error) q.set('error', error);
+    const qs = q.toString();
+    return {
+      url: `/dashboard/incidents/${id}${qs ? `?ask=1&${qs}` : '?ask=1'}`,
+      statusCode: 302,
+    };
+  }
+
+  @Get('incidents/:id/apply-fix/advanced')
   @Header('Content-Type', 'text/html; charset=utf-8')
-  async incidentApplyFix(
+  async incidentApplyFixAdvanced(
     @Param('id') id: string,
     @Query('queued') queued?: string,
     @Query('error') error?: string,
@@ -399,7 +699,7 @@ export class DashboardController {
       false,
       `
     <section>
-      <p><a href="/dashboard">← Back to dashboard</a> · <a href="/dashboard/incidents/${esc(i.id)}">Incident detail</a> · <a href="/dashboard/incidents/${esc(i.id)}/suggestion">View suggestion</a></p>
+      <p><a href="/dashboard">← Back to dashboard</a> · <a href="/dashboard/incidents/${esc(i.id)}">Incident detail</a> · ${askAgentButton(i.id)} · <a href="/dashboard/incidents/${esc(i.id)}/suggestion">View suggestion</a></p>
       ${banner}
       <h2>1. Suggested fix</h2>
       <p class="fix">${esc(fix)}</p>
@@ -416,7 +716,7 @@ export class DashboardController {
         ${paramFields}
         <label class="confirm-label">
           <input type="checkbox" name="acknowledge" value="1" required />
-          I reviewed the options. Apply this change in-cluster via the OpsPilot agent on the next heartbeat.
+          I reviewed the options. Apply this change in-cluster via Pulse on the next heartbeat.
         </label>
         <button type="submit" class="btn primary">Confirm &amp; apply via agent</button>
       </form>
@@ -490,7 +790,7 @@ export class DashboardController {
         replicas: body.replicas,
       });
       return {
-        url: `/dashboard/incidents/${id}/apply-fix?queued=1#apply-status`,
+        url: `/dashboard/incidents/${id}?ask=1&queued=1`,
         statusCode: 303,
       };
     } catch (err: any) {
@@ -498,7 +798,7 @@ export class DashboardController {
         ? err.response.message.join(', ')
         : err?.response?.message || err?.message || 'Failed to queue fix command';
       return {
-        url: `/dashboard/incidents/${id}/apply-fix?error=${encodeURIComponent(String(msg))}#apply-status`,
+        url: `/dashboard/incidents/${id}?ask=1&error=${encodeURIComponent(String(msg))}`,
         statusCode: 303,
       };
     }
@@ -532,12 +832,12 @@ export class DashboardController {
       i.severity,
     );
     const json = esc(JSON.stringify(snap, null, 2));
-    const action = this.incidentsService.suggestionAction(i);
+    const target = resolveDeploymentTarget(i);
     let actionLink = '';
     if ((i.severity || '').toLowerCase() !== 'info') {
-      if (action === 'apply') {
-        actionLink = ` · <a class="btn primary" href="/dashboard/incidents/${esc(i.id)}/apply-fix">Apply suggested fix</a>`;
-      } else if (action === 'view') {
+      if (target.deployment || isDockerContainerIncident(i)) {
+        actionLink = ` · ${askAgentButton(i.id)}`;
+      } else if (this.incidentsService.suggestionAction(i) === 'view') {
         actionLink = ` · <a class="btn" href="/dashboard/incidents/${esc(i.id)}/suggestion">View suggestion</a>`;
       }
     }
@@ -585,12 +885,18 @@ export class DashboardController {
   async agentLive(@Param('id') id: string) {
     const agent = await this.agentsService.getAgent(id);
     const pods = Array.isArray(agent.podInventory) ? agent.podInventory : [];
+    const containers = Array.isArray(agent.containerInventory)
+      ? agent.containerInventory
+      : [];
     return {
       id: agent.id,
       status: agent.status,
+      agentType: agentMode(agent),
       lastHeartbeatAt: agent.lastHeartbeatAt,
       podInventoryAt: agent.podInventoryAt,
+      containerInventoryAt: agent.containerInventoryAt,
       pods,
+      containers,
     };
   }
 
@@ -598,7 +904,8 @@ export class DashboardController {
   @Header('Content-Type', 'text/html; charset=utf-8')
   async agentDetail(@Param('id') id: string) {
     const agent = await this.agentsService.getAgent(id);
-    const pods = Array.isArray(agent.podInventory)
+    const isDocker = agentMode(agent) === 'docker-host';
+    const pods = !isDocker && Array.isArray(agent.podInventory)
       ? (agent.podInventory as Array<{
           namespace?: string;
           name?: string;
@@ -610,9 +917,24 @@ export class DashboardController {
           memory?: string;
         }>)
       : [];
+    const containers = isDocker && Array.isArray(agent.containerInventory)
+      ? (agent.containerInventory as Array<{
+          name?: string;
+          status?: string;
+          health?: string;
+          restarts?: number;
+          age?: string;
+          image?: string;
+          service?: string;
+        }>)
+      : [];
 
     const statusClass =
       agent.status === 'online' ? 'ok' : agent.status === 'revoked' ? 'crit' : 'off';
+
+    const inventoryAt = isDocker
+      ? agent.containerInventoryAt
+      : agent.podInventoryAt;
 
     const podRows = pods
       .map((p) => {
@@ -640,32 +962,43 @@ export class DashboardController {
       })
       .join('');
 
+    const containerRows = containers
+      .map((c) => {
+        const name = c.name || '';
+        return `
+      <tr data-container-key="${esc(name)}">
+        <td><code>${esc(name || '—')}</code></td>
+        <td data-f="service">${esc(c.service || '—')}</td>
+        <td data-f="status"><span class="badge ${podStatusClass(c.status)}">${esc(c.status || '—')}</span></td>
+        <td data-f="health">${esc(c.health || '—')}</td>
+        <td data-f="restarts">${esc(c.restarts ?? 0)}</td>
+        <td data-f="image"><code>${esc(c.image || '—')}</code></td>
+        <td data-f="age">${esc(c.age || '—')}</td>
+      </tr>`;
+      })
+      .join('');
+
     const liveScript = liveMonitorScript({
-      mode: 'agent',
+      mode: isDocker ? 'agent-containers' : 'agent',
       agentId: agent.id,
       pollMs: 3000,
     });
 
-    return layout(
-      `Agent ${agent.hostname}`,
-      `${agent.clusterName} · ${agent.environment} · live pod monitor`,
-      false,
-      `
+    const inventorySection = isDocker
+      ? `
     <section>
-      <p><a href="/dashboard">← Back to dashboard</a> · <a href="/dashboard/agents/${esc(agent.id)}/live">Live JSON</a></p>
-      <h2>Agent</h2>
-      <table>
-        <tr><th>ID</th><td><code>${esc(agent.id)}</code></td></tr>
-        <tr><th>Host</th><td>${esc(agent.hostname)}</td></tr>
-        <tr><th>Cluster</th><td>${esc(agent.clusterName)}</td></tr>
-        <tr><th>Env</th><td>${esc(agent.environment)}</td></tr>
-        <tr><th>Status</th><td><span id="live-agent-status" class="badge ${statusClass}">${esc(agent.status)}</span></td></tr>
-        <tr><th>Version</th><td>${esc(agent.version)}</td></tr>
-        <tr><th>Last heartbeat</th><td id="live-heartbeat">${agent.lastHeartbeatAt ? esc(new Date(agent.lastHeartbeatAt).toISOString()) : '—'}</td></tr>
-        <tr><th>Inventory updated</th><td id="live-inventory-at">${agent.podInventoryAt ? esc(new Date(agent.podInventoryAt).toISOString()) : '— (waiting for agent heartbeat)'}</td></tr>
-      </table>
-      <p class="muted" id="live-poll-hint">Live refresh every 3s from agent heartbeats (~10s).</p>
-    </section>
+      <h2>Monitored containers (<span id="live-container-count">${containers.length}</span>)</h2>
+      <p class="muted">Docker containers matched by the agent watch filter on this host.</p>
+      ${
+        containers.length
+          ? `<table id="live-container-table">
+        <thead><tr><th>Name</th><th>Service</th><th>Status</th><th>Health</th><th>Restarts</th><th>Image</th><th>Age</th></tr></thead>
+        <tbody>${containerRows}</tbody>
+      </table>`
+          : `<p class="empty" id="live-container-empty">No container inventory yet. Wait for the next agent heartbeat.</p>`
+      }
+    </section>`
+      : `
     <section>
       <h2>Monitored pods (<span id="live-pod-count">${pods.length}</span>)</h2>
       <p class="muted">Click a pod for detail + history. CPU/memory require metrics-server in the cluster.</p>
@@ -677,7 +1010,30 @@ export class DashboardController {
       </table>`
           : `<p class="empty" id="live-pod-empty">No pod inventory yet. Wait for the next agent heartbeat after upgrading the agent.</p>`
       }
-    </section>`,
+    </section>`;
+
+    return layout(
+      `Agent ${agent.hostname}`,
+      `${agent.clusterName} · ${agent.environment} · ${isDocker ? 'docker-host monitor' : 'live pod monitor'}`,
+      false,
+      `
+    <section>
+      <p><a href="/dashboard">← Back to dashboard</a> · <a href="/dashboard/agents/${esc(agent.id)}/live">Live JSON</a></p>
+      <h2>Agent</h2>
+      <table>
+        <tr><th>ID</th><td><code>${esc(agent.id)}</code></td></tr>
+        <tr><th>Host</th><td>${esc(agent.hostname)}</td></tr>
+        <tr><th>Cluster</th><td>${esc(agent.clusterName)}</td></tr>
+        <tr><th>Env</th><td>${esc(agent.environment)}</td></tr>
+        <tr><th>Mode</th><td>${esc(isDocker ? 'docker-host' : 'kubernetes')}</td></tr>
+        <tr><th>Status</th><td><span id="live-agent-status" class="badge ${statusClass}">${esc(agent.status)}</span></td></tr>
+        <tr><th>Version</th><td>${esc(agent.version)}</td></tr>
+        <tr><th>Last heartbeat</th><td id="live-heartbeat">${agent.lastHeartbeatAt ? esc(new Date(agent.lastHeartbeatAt).toISOString()) : '—'}</td></tr>
+        <tr><th>Inventory updated</th><td id="live-inventory-at">${inventoryAt ? esc(new Date(inventoryAt).toISOString()) : '— (waiting for agent heartbeat)'}</td></tr>
+      </table>
+      <p class="muted" id="live-poll-hint">Live refresh every 3s from agent heartbeats (~10s).</p>
+    </section>
+    ${inventorySection}`,
       liveScript,
     );
   }
@@ -1021,18 +1377,24 @@ function layout(
   body: string,
   script = '',
 ): string {
-  const refreshTag =
-    typeof autoRefresh === 'string' && autoRefresh
-      ? `<meta http-equiv="refresh" content="15;url=${esc(autoRefresh)}" />`
-      : autoRefresh
-        ? '<meta http-equiv="refresh" content="15" />'
-        : '';
+  const refreshScript = autoRefresh
+    ? `<script>
+(function(){
+  var url = ${JSON.stringify(typeof autoRefresh === 'string' ? autoRefresh : '')};
+  setInterval(function(){
+    var w = document.getElementById('ask-widget');
+    if (w && !w.hidden) return;
+    if (url) location.href = url;
+    else location.reload();
+  }, 15000);
+})();
+</script>`
+    : '';
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  ${refreshTag}
   <title>${esc(title)}</title>
   <style>
     :root {
@@ -1075,6 +1437,23 @@ function layout(
       overflow-x: auto;
     }
     h2 { margin: 0 0 1rem; font-size: 1.1rem; }
+    .source-tabs {
+      display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0 0 0.85rem;
+    }
+    .source-tabs .tab {
+      display: inline-flex; align-items: center; gap: 0.35rem;
+      padding: 0.35rem 0.75rem; border-radius: 999px;
+      border: 1px solid var(--line); background: #121820;
+      color: var(--muted); text-decoration: none; font-size: 0.85rem;
+    }
+    .source-tabs .tab:hover { border-color: var(--accent); color: var(--text); }
+    .source-tabs .tab.active {
+      background: rgba(91, 159, 212, 0.15); border-color: var(--accent); color: #dce9ff;
+    }
+    .source-tabs .tab-count {
+      display: inline-block; min-width: 1.1rem; text-align: center;
+      font-size: 0.75rem; font-weight: 700; color: inherit;
+    }
     h3 { margin: 1.25rem 0 0.5rem; font-size: 1rem; color: #c5d4ea; }
     table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
     th, td { text-align: left; padding: 0.65rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -1116,6 +1495,221 @@ function layout(
     a.btn { text-decoration: none; }
     .autofix-col { min-width: 9.5rem; position: sticky; left: 0; background: var(--panel); z-index: 1; }
     .autofix-btn { font-weight: 700; white-space: nowrap; font-size: 0.75rem; }
+    .ask-widget {
+      position: fixed; right: 1.15rem; bottom: 1.15rem; z-index: 80;
+      width: min(420px, calc(100vw - 1.5rem));
+      height: min(640px, calc(100vh - 2.4rem));
+      display: flex; flex-direction: column; align-items: flex-end; justify-content: flex-end;
+      gap: 0.7rem;
+    }
+    .ask-widget[hidden] { display: none !important; }
+    .ask-widget .chatbox {
+      width: 100%; height: 100%; min-height: 0; max-width: none; margin: 0;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+    }
+    .ask-widget.minimized {
+      width: auto; height: auto; right: 0; left: 0; bottom: 0.85rem;
+      align-items: center; pointer-events: none;
+    }
+    .ask-widget.minimized .chatbox { display: none; }
+    .ask-widget.maximized {
+      inset: 0;
+      right: 0; left: 0; top: 0; bottom: 0;
+      width: 100vw; height: 100vh;
+      max-width: none; max-height: none;
+      padding: 0; gap: 0; z-index: 120;
+      align-items: stretch; justify-content: stretch;
+    }
+    .ask-widget.maximized .chatbox {
+      width: 100%; height: 100%;
+      border-radius: 0; border-left: 0; border-right: 0;
+      box-shadow: none;
+    }
+    .ask-dock {
+      display: none; pointer-events: auto; position: relative;
+      align-items: flex-end; justify-content: center;
+      padding: 0.45rem 0.85rem 0.55rem;
+      background: linear-gradient(180deg, rgba(36,48,64,.72), rgba(18,24,32,.88));
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 22px;
+      box-shadow: 0 12px 32px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.12);
+      backdrop-filter: blur(16px);
+    }
+    .ask-widget.minimized .ask-dock { display: flex; }
+    .ask-dock-icon {
+      width: 3.4rem; height: 3.4rem; border: 0; cursor: pointer; padding: 0;
+      border-radius: 18px;
+      background: linear-gradient(145deg, #5b9fd4, #3dd68c);
+      color: #0c1017; font-weight: 800; font-size: 0.82rem;
+      box-shadow: 0 8px 18px rgba(0,0,0,.35);
+      transition: transform .16s ease;
+    }
+    .ask-dock-icon:hover { transform: scale(1.18) translateY(-6px); }
+    .ask-dock-label {
+      position: absolute; left: 50%; bottom: calc(100% + 0.4rem); transform: translateX(-50%);
+      background: #1a2332; color: var(--text); font-size: 0.72rem; font-weight: 600;
+      padding: 0.2rem 0.45rem; border-radius: 6px; border: 1px solid var(--line);
+      opacity: 0; pointer-events: none; white-space: nowrap;
+    }
+    .ask-dock:hover .ask-dock-label { opacity: 1; }
+    .chatbox-head-text { min-width: 0; overflow: hidden; }
+    .chatbox-actions { display: flex; gap: 0.3rem; flex-shrink: 0; }
+    .chatbox-icon {
+      width: 1.9rem; height: 1.9rem; border-radius: 8px; cursor: pointer;
+      background: rgba(255,255,255,.16); color: #fff; border: 1px solid rgba(255,255,255,.35);
+      font-size: 1.05rem; line-height: 1; font-weight: 700; flex-shrink: 0;
+    }
+    .chatbox-icon:hover { background: rgba(255,255,255,.28); }
+    .chatbox {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      min-width: 0;
+      background: #121820;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 18px 50px rgba(0,0,0,.45);
+    }
+    .chatbox-head {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 0.6rem;
+      min-width: 0;
+      padding: 0.7rem 0.75rem;
+      border-bottom: 1px solid var(--line);
+      background: #0f6e6e;
+      cursor: grab;
+      user-select: none;
+      touch-action: none;
+    }
+    .ask-widget.dragging .chatbox-head { cursor: grabbing; }
+    .ask-widget.maximized .chatbox-head { cursor: default; }
+    .chatbox-actions, .chatbox-actions * { cursor: pointer; }
+    .chatbox-avatar {
+      width: 2.35rem; height: 2.35rem; border-radius: 10px;
+      display: grid; place-items: center;
+      background: linear-gradient(145deg, #5b9fd4, #3dd68c);
+      color: #0c1017; font-weight: 800; font-size: 0.78rem; letter-spacing: 0.02em;
+      flex-shrink: 0;
+    }
+    .chatbox-title { font-weight: 700; font-size: 0.95rem; color: #f4fffe; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chatbox-sub { color: rgba(244,255,254,.78); font-size: 0.75rem; margin-top: 0.12rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .chat-log {
+      padding: 1.15rem 1.1rem 0.5rem;
+      overflow-x: hidden;
+      overflow-y: auto;
+      min-height: 0;
+      min-width: 0;
+      display: flex; flex-direction: column; gap: 0.85rem;
+      background:
+        radial-gradient(900px 280px at 10% 0%, rgba(91,159,212,.08), transparent 55%),
+        #10161e;
+    }
+    .chat-row { display: flex; gap: 0.65rem; align-items: flex-end; max-width: 100%; min-width: 0; }
+    .chat-row.bot { align-self: stretch; }
+    .chat-row.user { align-self: stretch; flex-direction: row-reverse; }
+    .chat-row.sys { align-self: center; max-width: 100%; }
+    .msg-avatar {
+      width: 1.7rem; height: 1.7rem; border-radius: 8px;
+      display: grid; place-items: center; font-size: 0.62rem; font-weight: 800;
+      flex-shrink: 0;
+    }
+    .chat-row.bot .msg-avatar { background: #243447; color: #9ec1ff; }
+    .chat-row.user .msg-avatar { background: #2a4a6a; color: #dce9ff; }
+    .chat-bubble {
+      padding: 0.75rem 0.9rem; border-radius: 14px; line-height: 1.5; font-size: 0.92rem;
+      flex: 0 1 auto; min-width: 0; max-width: calc(100% - 2.4rem);
+      overflow-wrap: anywhere; word-break: break-word;
+    }
+    .chat-bubble code { white-space: pre-wrap; word-break: break-word; }
+    .chat-row.bot .chat-bubble {
+      background: #1c2736; color: var(--text);
+      border-top-left-radius: 5px;
+    }
+    .chat-row.user .chat-bubble {
+      background: #2d5f8a; color: #f2f7ff;
+      border-top-right-radius: 5px;
+    }
+    .chat-row.sys .chat-bubble {
+      background: transparent; color: var(--muted); font-size: 0.8rem;
+      padding: 0.2rem 0; text-align: center;
+    }
+    .chat-row.sys.chat-blink .chat-bubble {
+      animation: ask-blink 1.1s ease-in-out infinite;
+    }
+    @keyframes ask-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.22; }
+    }
+    .ask-via {
+      margin-top: 0.55rem; font-size: 0.72rem; color: var(--muted); letter-spacing: 0.02em;
+    }
+    .ask-caret {
+      display: inline-block; width: 0.45em; margin-left: 1px;
+      border-right: 2px solid #9ec1ff; animation: ask-caret-blink 0.8s step-end infinite;
+      vertical-align: -0.05em;
+    }
+    @keyframes ask-caret-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+    .ask-think {
+      align-self: stretch;
+      margin: 0.15rem 0 0.35rem 2.35rem;
+      padding: 0.85rem 0.9rem;
+      border-left: 2px solid #3a4d66;
+      background: rgba(20, 28, 40, 0.65);
+      border-radius: 0 8px 8px 0;
+      min-height: 7.5rem;
+      max-height: 16rem;
+      overflow: auto;
+      font-size: 0.82rem;
+      color: #8fa3bc;
+      line-height: 1.5;
+    }
+    .ask-think-tools { display: grid; gap: 0.35rem; margin-bottom: 0.55rem; }
+    .ask-think-tool { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; color: #9ec1ff; }
+    .ask-think-tool.done { color: #7d93ab; }
+    .ask-think-tool.err { color: #e8a0a0; }
+    .ask-think-body { white-space: pre-wrap; word-break: break-word; opacity: 0.92; min-height: 3.5rem; }
+    .chatbox-dock {
+      padding: 0.7rem 1rem 1rem;
+      border-top: 1px solid var(--line);
+      background: #17202c;
+      display: grid; gap: 0.55rem;
+    }
+    .chat-inline-chips {
+      display: flex; flex-wrap: wrap; gap: 0.4rem;
+      margin-top: 0.7rem;
+    }
+    .chat-inline-chip {
+      border-radius: 999px; padding: 0.4rem 0.75rem; font-size: 0.8rem;
+      background: #243447; color: var(--text); cursor: pointer;
+      border: 1px solid var(--line); text-align: left;
+    }
+    .chat-inline-chip:hover { border-color: var(--accent); }
+    .chat-confirm { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .chat-confirm[hidden] { display: none !important; }
+    .chatbox-dock { flex-shrink: 0; min-width: 0; }
+    .chat-composer {
+      display: flex; align-items: flex-end; gap: 0.55rem;
+      background: #0c1017; border: 1px solid var(--line);
+      border-radius: 16px; padding: 0.45rem 0.5rem 0.45rem 0.85rem;
+      min-width: 0;
+    }
+    .chat-composer:focus-within { border-color: var(--accent); }
+    .chat-composer textarea {
+      flex: 1 1 auto; min-width: 0; resize: none; border: 0; outline: none; background: transparent;
+      color: var(--text); font: inherit; font-size: 0.95rem; line-height: 1.4;
+      max-height: 7.5rem; min-height: 1.4rem;
+    }
+    .chat-send {
+      flex: 0 0 auto; border: 0; cursor: pointer; border-radius: 12px;
+      background: #5b9fd4; color: #0c1017; font-weight: 700;
+      padding: 0.5rem 0.9rem; font-size: 0.85rem; white-space: nowrap;
+    }
+    .chat-send:hover { filter: brightness(1.08); }
     .cmd-block { margin-bottom: 1rem; }
     .cmd-block.preview pre { opacity: 0.55; user-select: none; filter: blur(0.4px); }
     .cmd-head { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; margin-bottom: 0.35rem; }
@@ -1149,9 +1743,700 @@ function layout(
     </nav>
   </header>
   <main>${body}</main>
+  ${askAgentWidgetMarkup()}
+  ${askAgentWidgetScript()}
+  ${refreshScript}
   ${script}
 </body>
 </html>`;
+}
+
+function askAgentButton(incidentId: string): string {
+  return `<button type="button" class="btn primary autofix-btn js-ask-agent" data-incident-id="${esc(incidentId)}">Ask Pulse</button>`;
+}
+
+function askAgentWidgetMarkup(): string {
+  return `
+  <div class="ask-widget" id="ask-widget" hidden>
+    <div class="ask-dock" id="ask-dock" title="Pulse">
+      <span class="ask-dock-label">Pulse</span>
+      <button type="button" class="ask-dock-icon" id="ask-dock-icon">PL</button>
+    </div>
+    <div class="chatbox" id="ask-chat">
+      <header class="chatbox-head">
+        <div class="chatbox-avatar" aria-hidden="true">PL</div>
+        <div class="chatbox-head-text">
+          <div class="chatbox-title">Pulse</div>
+          <div class="chatbox-sub" id="ask-chat-sub"></div>
+        </div>
+        <div class="chatbox-actions">
+          <button type="button" class="chatbox-icon" id="ask-max" title="Maximize">□</button>
+          <button type="button" class="chatbox-icon" id="ask-min" title="Minimize to Dock">–</button>
+          <button type="button" class="chatbox-icon" id="ask-close" title="Close">×</button>
+        </div>
+      </header>
+      <div class="chat-log" id="ask-chat-log"></div>
+      <div class="chatbox-dock">
+        <div class="chat-chips" id="ask-chips"></div>
+        <div class="chat-confirm" id="ask-confirm" hidden>
+          <button type="button" class="btn primary" id="ask-yes">Yes, apply via Pulse</button>
+          <button type="button" class="btn" id="ask-no">No, pick again</button>
+        </div>
+        <form class="chat-composer" id="ask-composer" autocomplete="off">
+          <textarea id="ask-input" rows="1" placeholder="Ask what happened, why, or how to fix…"></textarea>
+          <button type="submit" class="chat-send" id="ask-input-go" title="Send">Send</button>
+        </form>
+      </div>
+    </div>
+  </div>`;
+}
+
+function askAgentWidgetScript(): string {
+  const openPrompt = JSON.stringify(ASK_OPEN_PROMPT);
+  return `<script>
+(function(){
+  var openPrompt = ${openPrompt};
+  var widget = document.getElementById('ask-widget');
+  var log = document.getElementById('ask-chat-log');
+  var chips = document.getElementById('ask-chips');
+  var composer = document.getElementById('ask-composer');
+  var inputEl = document.getElementById('ask-input');
+  var confirmRow = document.getElementById('ask-confirm');
+  var yesBtn = document.getElementById('ask-yes');
+  var noBtn = document.getElementById('ask-no');
+  var subEl = document.getElementById('ask-chat-sub');
+  var minBtn = document.getElementById('ask-min');
+  var maxBtn = document.getElementById('ask-max');
+  var closeBtn = document.getElementById('ask-close');
+  var dockIcon = document.getElementById('ask-dock-icon');
+  var incidentId = null;
+  var session = null;
+  var pending = null;
+  var pollTimer = null;
+  var awaitingValue = false;
+  var history = [];
+  var busy = false;
+  var STORE_KEY = 'pulse-ask-v1';
+  var posLeft = null;
+  var posTop = null;
+  var dragState = null;
+  var chatHead = document.querySelector('#ask-chat .chatbox-head');
+
+  function clampPos(left, top){
+    var w = widget.offsetWidth || 420;
+    var h = widget.offsetHeight || 640;
+    var maxL = Math.max(0, window.innerWidth - w);
+    var maxT = Math.max(0, window.innerHeight - h);
+    return {
+      left: Math.min(maxL, Math.max(0, left)),
+      top: Math.min(maxT, Math.max(0, top))
+    };
+  }
+  function applyPos(left, top){
+    var p = clampPos(left, top);
+    posLeft = p.left;
+    posTop = p.top;
+    widget.style.left = p.left + 'px';
+    widget.style.top = p.top + 'px';
+    widget.style.right = 'auto';
+    widget.style.bottom = 'auto';
+    widget.classList.add('dragged');
+  }
+  function clearPosStyles(){
+    widget.style.left = '';
+    widget.style.top = '';
+    widget.style.right = '';
+    widget.style.bottom = '';
+    widget.classList.remove('dragged');
+  }
+  function restorePos(){
+    if (posLeft == null || posTop == null) {
+      clearPosStyles();
+      return;
+    }
+    if (widget.classList.contains('maximized') || widget.classList.contains('minimized')) {
+      clearPosStyles();
+      return;
+    }
+    applyPos(posLeft, posTop);
+  }
+
+  function persist(){
+    try {
+      if (widget.hidden || !incidentId) {
+        sessionStorage.removeItem(STORE_KEY);
+        return;
+      }
+      sessionStorage.setItem(STORE_KEY, JSON.stringify({
+        minimized: widget.classList.contains('minimized'),
+        maximized: widget.classList.contains('maximized'),
+        incidentId: incidentId,
+        subtitle: subEl ? subEl.textContent : '',
+        history: history,
+        options: (session && session.options) || [],
+        sessionOk: !!session,
+        pending: pending,
+        awaitingValue: awaitingValue,
+        confirmVisible: confirmRow && !confirmRow.hidden,
+        poll: !!pollTimer,
+        logHtml: log ? log.innerHTML : '',
+        placeholder: inputEl ? inputEl.placeholder : '',
+        posLeft: posLeft,
+        posTop: posTop
+      }));
+    } catch (e) {}
+  }
+  function clearPersist(){
+    try { sessionStorage.removeItem(STORE_KEY); } catch (e) {}
+  }
+  function rebindChips(){
+    var opts = (session && session.options) || [];
+    if (!opts.length || !log) return;
+    log.querySelectorAll('.chat-inline-chip').forEach(function(btn){
+      var label = btn.textContent;
+      var opt = null;
+      for (var i = 0; i < opts.length; i++) {
+        if (opts[i].label === label) { opt = opts[i]; break; }
+      }
+      if (!opt) return;
+      btn.addEventListener('click', function(){ pickOption(opt); });
+    });
+  }
+  function restorePersisted(){
+    var raw = null;
+    try { raw = sessionStorage.getItem(STORE_KEY); } catch (e) { return false; }
+    if (!raw) return false;
+    var data;
+    try { data = JSON.parse(raw); } catch (e) { return false; }
+    if (!data || !data.incidentId || !data.sessionOk) return false;
+    incidentId = data.incidentId;
+    history = Array.isArray(data.history) ? data.history : [];
+    session = { options: Array.isArray(data.options) ? data.options : [], subtitle: data.subtitle || '' };
+    pending = data.pending || null;
+    awaitingValue = !!data.awaitingValue;
+    posLeft = typeof data.posLeft === 'number' ? data.posLeft : null;
+    posTop = typeof data.posTop === 'number' ? data.posTop : null;
+    widget.hidden = false;
+    widget.classList.toggle('minimized', !!data.minimized);
+    widget.classList.toggle('maximized', !!data.maximized && !data.minimized);
+    syncMaxButton();
+    restorePos();
+    if (subEl) subEl.textContent = data.subtitle || '';
+    if (log) log.innerHTML = data.logHtml || '';
+    rebindChips();
+    if (confirmRow) confirmRow.hidden = !data.confirmVisible;
+    if (inputEl && data.placeholder) inputEl.placeholder = data.placeholder;
+    if (data.poll) startPoll();
+    return true;
+  }
+
+  function esc(s){
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function nl(s){
+    return esc(s).replace(/\\n/g, '<br/>');
+  }
+  function typeReply(bubble, text){
+    return new Promise(function(resolve){
+      var full = String(text == null ? '' : text);
+      if (!full) { resolve(); return; }
+      var body = document.createElement('span');
+      body.className = 'ask-type-body';
+      var caret = document.createElement('span');
+      caret.className = 'ask-caret';
+      bubble.appendChild(body);
+      bubble.appendChild(caret);
+      var i = 0;
+      var step = Math.max(1, Math.ceil(full.length / 100));
+      function tick(){
+        i = Math.min(full.length, i + step);
+        body.innerHTML = nl(full.slice(0, i));
+        log.scrollTop = log.scrollHeight;
+        if (i >= full.length) {
+          caret.remove();
+          resolve();
+          return;
+        }
+        setTimeout(tick, 16);
+      }
+      tick();
+    });
+  }
+  function add(role, html){
+    var row = document.createElement('div');
+    row.className = 'chat-row ' + role;
+    if (role !== 'sys') {
+      var av = document.createElement('div');
+      av.className = 'msg-avatar';
+      av.textContent = role === 'user' ? 'You' : 'PL';
+      row.appendChild(av);
+    }
+    var d = document.createElement('div');
+    d.className = 'chat-bubble';
+    d.innerHTML = html;
+    row.appendChild(d);
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+    return d;
+  }
+  function clearChips(){ if (chips) chips.innerHTML = ''; }
+  function hideConfirm(){ confirmRow.hidden = true; }
+  function stopPoll(){
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+  function attachChips(bubble, options){
+    if (!bubble || !options || !options.length) return;
+    var wrap = document.createElement('div');
+    wrap.className = 'chat-inline-chips';
+    options.forEach(function(opt){
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chat-inline-chip';
+      b.textContent = opt.label;
+      b.addEventListener('click', function(){ pickOption(opt); });
+      wrap.appendChild(b);
+    });
+    bubble.appendChild(wrap);
+  }
+  function showOptions(){
+    clearChips();
+    if (session && session.options && session.options.length) {
+      var bubble = add('bot', 'Suggested actions:');
+      attachChips(bubble, session.options);
+    }
+  }
+  function applyPropose(propose){
+    if (!propose || !propose.optionId) return;
+    var opt = (session.options || []).find(function(o){ return o.id === propose.optionId; });
+    if (!opt) return;
+    pending = {
+      option: opt,
+      optionId: opt.id,
+      userInput: propose.userInput || '',
+      label: opt.label,
+      detail: opt.detail,
+    };
+    confirmRow.hidden = false;
+  }
+  function resetThread(){
+    stopPoll();
+    pending = null;
+    awaitingValue = false;
+    history = [];
+    busy = false;
+    hideConfirm();
+    clearChips();
+    log.innerHTML = '';
+    inputEl.value = '';
+    inputEl.placeholder = 'Ask what happened, why, or how to fix…';
+    inputEl.style.height = 'auto';
+  }
+  function closeWidget(){
+    stopPoll();
+    widget.hidden = true;
+    widget.classList.remove('minimized');
+    widget.classList.remove('maximized');
+    clearPosStyles();
+    posLeft = null;
+    posTop = null;
+    syncMaxButton();
+    clearPersist();
+  }
+  function minimizeWidget(){
+    widget.classList.remove('maximized');
+    widget.classList.add('minimized');
+    clearPosStyles();
+    syncMaxButton();
+    persist();
+  }
+  function maximizeWidget(){
+    widget.classList.remove('minimized');
+    widget.classList.add('maximized');
+    clearPosStyles();
+    syncMaxButton();
+    inputEl && inputEl.focus();
+    persist();
+  }
+  function restoreWidget(){
+    widget.classList.remove('minimized');
+    restorePos();
+    inputEl && inputEl.focus();
+    persist();
+  }
+  function syncMaxButton(){
+    if (!maxBtn) return;
+    var on = widget.classList.contains('maximized');
+    maxBtn.textContent = on ? '❐' : '□';
+    maxBtn.title = on ? 'Restore' : 'Maximize';
+  }
+  function toggleMaximize(){
+    if (widget.classList.contains('maximized')) {
+      widget.classList.remove('maximized');
+      restorePos();
+      syncMaxButton();
+      inputEl && inputEl.focus();
+      persist();
+      return;
+    }
+    maximizeWidget();
+  }
+  function onDragStart(ev){
+    if (widget.hidden || widget.classList.contains('minimized') || widget.classList.contains('maximized')) return;
+    if (ev.target && ev.target.closest && ev.target.closest('.chatbox-icon')) return;
+    var point = ev.touches && ev.touches[0] ? ev.touches[0] : ev;
+    var rect = widget.getBoundingClientRect();
+    dragState = {
+      dx: point.clientX - rect.left,
+      dy: point.clientY - rect.top
+    };
+    applyPos(rect.left, rect.top);
+    widget.classList.add('dragging');
+    ev.preventDefault();
+  }
+  function onDragMove(ev){
+    if (!dragState) return;
+    var point = ev.touches && ev.touches[0] ? ev.touches[0] : ev;
+    applyPos(point.clientX - dragState.dx, point.clientY - dragState.dy);
+    ev.preventDefault();
+  }
+  function onDragEnd(){
+    if (!dragState) return;
+    dragState = null;
+    widget.classList.remove('dragging');
+    persist();
+  }
+  if (chatHead) {
+    chatHead.addEventListener('mousedown', onDragStart);
+    chatHead.addEventListener('touchstart', onDragStart, { passive: false });
+  }
+  window.addEventListener('mousemove', onDragMove);
+  window.addEventListener('touchmove', onDragMove, { passive: false });
+  window.addEventListener('mouseup', onDragEnd);
+  window.addEventListener('touchend', onDragEnd);
+  async function openAsk(id, opts){
+    opts = opts || {};
+    if (!id) return;
+    widget.hidden = false;
+    restoreWidget();
+    if (incidentId === id && session) {
+      if (opts.error) add('bot', esc(opts.error));
+      if (opts.poll) startPoll();
+      persist();
+      inputEl.focus();
+      return;
+    }
+    incidentId = id;
+    resetThread();
+    subEl.textContent = 'Loading…';
+    add('sys', 'Connecting to Pulse…');
+    try {
+      var res = await fetch('/dashboard/incidents/' + encodeURIComponent(id) + '/ask-agent/session', {cache:'no-store'});
+      var data = await res.json();
+      log.innerHTML = '';
+      if (!data.ok) {
+        subEl.textContent = 'Unavailable';
+        add('bot', esc(data.error || 'Pulse is not available for this incident.'));
+        return;
+      }
+      session = data;
+      session.options = [];
+      subEl.textContent = data.subtitle || '';
+      if (opts.error) add('bot', esc(opts.error));
+      if (opts.poll || data.poll) startPoll();
+      await talkToAgent(openPrompt, { hideUser: true });
+      persist();
+      inputEl.focus();
+    } catch (e) {
+      log.innerHTML = '';
+      add('bot', 'Could not load Pulse. Stay on this page and try again.');
+      persist();
+    }
+  }
+
+  async function talkToAgent(text, flags){
+    flags = flags || {};
+    if (busy || !incidentId) return;
+    busy = true;
+    if (!flags.hideUser) {
+      history.push({ role: 'user', content: text });
+    }
+    var typing = add('sys', 'PL is working…');
+    if (typing.parentNode) typing.parentNode.classList.add('chat-blink');
+    var thinkBox = document.createElement('div');
+    thinkBox.className = 'ask-think';
+    thinkBox.hidden = true;
+    var thinkTools = document.createElement('div');
+    thinkTools.className = 'ask-think-tools';
+    var thinkBody = document.createElement('div');
+    thinkBody.className = 'ask-think-body';
+    thinkBox.appendChild(thinkTools);
+    thinkBox.appendChild(thinkBody);
+    log.appendChild(thinkBox);
+    var thinkText = '';
+    var toolRows = {};
+
+    function showThink(){
+      thinkBox.hidden = false;
+      log.scrollTop = log.scrollHeight;
+    }
+    function onTool(name, status, callId){
+      showThink();
+      var key = String(callId || name || 'tool');
+      var row = toolRows[key];
+      if (!row) {
+        row = document.createElement('div');
+        row.className = 'ask-think-tool';
+        thinkTools.appendChild(row);
+        toolRows[key] = row;
+      }
+      var mark = status === 'completed' ? '✓' : status === 'error' ? '✕' : '→';
+      row.className = 'ask-think-tool' + (status === 'completed' ? ' done' : status === 'error' ? ' err' : '');
+      row.textContent = mark + ' ' + String(name || 'tool');
+      log.scrollTop = log.scrollHeight;
+    }
+    function onThinking(chunk){
+      showThink();
+      var t = String(chunk || '');
+      if (!t) return;
+      if (thinkText && t.indexOf(thinkText) === 0) thinkText = t;
+      else if (thinkText && thinkText.indexOf(t) === 0) { /* older cumulative */ }
+      else thinkText = (thinkText ? thinkText + (/\s$/.test(thinkText) ? '' : ' ') : '') + t;
+      if (thinkText.length > 1800) thinkText = thinkText.slice(-1800);
+      thinkBody.textContent = thinkText;
+      log.scrollTop = log.scrollHeight;
+    }
+
+    try {
+      var res = await fetch('/dashboard/incidents/' + encodeURIComponent(incidentId) + '/ask-agent/chat-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+        body: JSON.stringify({ message: text, history: history }),
+      });
+      if (!res.ok || !res.body) {
+        typing.parentNode && typing.parentNode.remove();
+        thinkBox.remove();
+        add('bot', 'Could not start Cursor stream (' + res.status + ').');
+        return;
+      }
+      var reader = res.body.getReader();
+      var decoder = new TextDecoder();
+      var buf = '';
+      var donePayload = null;
+      var errMsg = '';
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, { stream: true });
+        var parts = buf.split('\\n\\n');
+        buf = parts.pop() || '';
+        for (var pi = 0; pi < parts.length; pi++) {
+          var block = parts[pi].trim();
+          if (!block) continue;
+          var lines = block.split('\\n');
+          var dataLines = [];
+          for (var li = 0; li < lines.length; li++) {
+            if (lines[li].indexOf('data:') === 0) dataLines.push(lines[li].slice(5).trim());
+          }
+          if (!dataLines.length) continue;
+          var ev;
+          try { ev = JSON.parse(dataLines.join('\\n')); } catch (e) { continue; }
+          if (ev.type === 'thinking') onThinking(ev.text);
+          else if (ev.type === 'tool') onTool(ev.name, ev.status, ev.callId);
+          else if (ev.type === 'status' && ev.text) {
+            showThink();
+            if (!thinkText) thinkBody.textContent = String(ev.text);
+          }
+          else if (ev.type === 'done') donePayload = ev.result || null;
+          else if (ev.type === 'error') errMsg = ev.message || 'Stream error';
+        }
+      }
+      typing.parentNode && typing.parentNode.remove();
+      if (errMsg) {
+        if (!thinkText && !Object.keys(toolRows).length) thinkBox.remove();
+        add('bot', esc(errMsg));
+        return;
+      }
+      if (!donePayload || !donePayload.reply) {
+        if (!thinkText && !Object.keys(toolRows).length) thinkBox.remove();
+        add('bot', 'Cursor + OpsPilot MCP did not return a reply.');
+        return;
+      }
+      var reply = donePayload.reply || '';
+      history.push({ role: 'assistant', content: reply });
+      var bubble = add('bot', '');
+      await typeReply(bubble, reply);
+      if (donePayload.source === 'cursor-mcp' || donePayload.source === 'openai') {
+        var via = document.createElement('div');
+        via.className = 'ask-via';
+        via.textContent =
+          donePayload.source === 'cursor-mcp' ? 'Cursor · OpsPilot MCP' : 'OpenAI';
+        bubble.appendChild(via);
+      }
+      if (donePayload.options && donePayload.options.length) {
+        session.options = donePayload.options;
+        attachChips(bubble, donePayload.options);
+      }
+      if (donePayload.propose && donePayload.propose.optionId) applyPropose(donePayload.propose);
+    } catch (e) {
+      typing.parentNode && typing.parentNode.remove();
+      thinkBox.remove();
+      add('bot', 'Network error talking to Cursor. Ask again, or try later.');
+    } finally {
+      busy = false;
+      persist();
+    }
+  }
+
+  function pickOption(opt){
+    add('user', esc(opt.label));
+    history.push({ role: 'user', content: opt.label });
+    hideConfirm();
+    if (opt.needsInput) {
+    pending = { option: opt, optionId: opt.id, userInput: '', label: opt.label, needsInput: opt.needsInput, detail: opt.detail };
+      awaitingValue = true;
+      add('bot', esc(opt.detail) + '<br/>Type the value below and press Send.');
+      if (opt.needsInput === 'image') inputEl.placeholder = 'registry/app:tag';
+      if (opt.needsInput === 'memory') inputEl.placeholder = 'e.g. 512Mi';
+      if (opt.needsInput === 'replicas') inputEl.placeholder = 'e.g. 2';
+      inputEl.focus();
+      persist();
+      return;
+    }
+    pending = { option: opt, optionId: opt.id, userInput: '', label: opt.label, detail: opt.detail };
+    add('bot', esc(opt.detail) + '<br/><strong>Apply this via Pulse?</strong>');
+    confirmRow.hidden = false;
+    persist();
+  }
+
+  function afterInput(){
+    var v = (inputEl.value || '').trim();
+    if (!v || busy) return;
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+    add('user', esc(v));
+    history.push({ role: 'user', content: v });
+    if (pending && awaitingValue) {
+      pending.userInput = v;
+      awaitingValue = false;
+      inputEl.placeholder = 'Ask what happened, why, or how to fix…';
+      add('bot', 'Plan: ' + esc(pending.detail) + ' → <code>' + esc(v) + '</code><br/><strong>Apply this via Pulse?</strong>');
+      confirmRow.hidden = false;
+      persist();
+      return;
+    }
+    hideConfirm();
+    talkToAgent(v, { hideUser: true });
+  }
+
+  async function applyNow(){
+    if (!pending || !incidentId) return;
+    hideConfirm();
+    add('sys', 'Queueing fix for the in-cluster agent…');
+    try {
+      var res = await fetch('/dashboard/incidents/' + encodeURIComponent(incidentId) + '/ask-agent/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          optionId: pending.optionId,
+          option: pending.option || undefined,
+          userInput: pending.userInput || undefined
+        }),
+      });
+      var data = await res.json();
+      if (!data.ok) {
+        add('bot', 'Could not queue fix: ' + esc(data.error || 'unknown error'));
+        showOptions();
+        return;
+      }
+      add('bot', 'Queued <code>' + esc(data.type) + '</code> — waiting for agent heartbeat…');
+      pending = null;
+      startPoll();
+      persist();
+    } catch (e) {
+      add('bot', 'Network error queueing fix.');
+      showOptions();
+      persist();
+    }
+  }
+
+  async function pollOnce(){
+    if (!incidentId) return;
+    try {
+      var res = await fetch('/dashboard/incidents/' + encodeURIComponent(incidentId) + '/apply-status', {cache:'no-store'});
+      if (!res.ok) return;
+      var data = await res.json();
+      var cmds = data.commands || [];
+      if (!cmds.length) return;
+      var latest = cmds[0];
+      var el = document.getElementById('ask-status-line');
+      var text = latest.status + (latest.result ? ' — ' + latest.result : '') + (latest.error ? ' — ' + latest.error : '');
+      if (!el) {
+        add('sys', '<span id="ask-status-line">Apply status: ' + esc(text) + '</span>');
+      } else {
+        el.textContent = 'Apply status: ' + text;
+      }
+      if (!data.pending) {
+        stopPoll();
+        if (latest.status === 'succeeded') add('bot', 'Done. Agent applied the fix successfully.');
+        else if (latest.status === 'failed') {
+          add('bot', 'Agent reported failure: ' + esc(latest.error || 'unknown'));
+          showOptions();
+        }
+      }
+    } catch (e) {}
+  }
+  function startPoll(){
+    stopPoll();
+    pollOnce();
+    pollTimer = setInterval(pollOnce, 3000);
+  }
+
+  document.addEventListener('click', function(ev){
+    var t = ev.target && ev.target.closest ? ev.target.closest('.js-ask-agent') : null;
+    if (!t) return;
+    ev.preventDefault();
+    openAsk(t.getAttribute('data-incident-id'));
+  });
+  composer.addEventListener('submit', function(ev){
+    ev.preventDefault();
+    afterInput();
+  });
+  inputEl.addEventListener('keydown', function(ev){
+    if (ev.key === 'Enter' && !ev.shiftKey) {
+      ev.preventDefault();
+      afterInput();
+    }
+  });
+  inputEl.addEventListener('input', function(){
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+  });
+  yesBtn.addEventListener('click', applyNow);
+  noBtn.addEventListener('click', function(){
+    hideConfirm();
+    pending = null;
+    add('sys', 'Okay — tell me more, or pick a suggested fix.');
+    showOptions();
+  });
+  minBtn.addEventListener('click', minimizeWidget);
+  maxBtn.addEventListener('click', toggleMaximize);
+  dockIcon.addEventListener('click', restoreWidget);
+  closeBtn.addEventListener('click', closeWidget);
+  window.addEventListener('pagehide', persist);
+  window.addEventListener('beforeunload', persist);
+
+  var params = new URLSearchParams(location.search);
+  var ask = params.get('ask');
+  var pathId = (location.pathname.match(/\\/dashboard\\/incidents\\/([^/]+)/) || [])[1];
+  var openId = ask && ask !== '1' ? ask : (ask === '1' ? pathId : null);
+  if (openId) {
+    openAsk(openId, { poll: params.get('queued') === '1', error: params.get('error') || '' });
+  } else {
+    restorePersisted();
+  }
+})();
+</script>`;
 }
 
 function applyStatusPollScript(incidentId: string): string {
@@ -1224,7 +2509,7 @@ function applyStatusPollScript(incidentId: string): string {
 }
 
 function liveMonitorScript(opts: {
-  mode: 'agent' | 'pod';
+  mode: 'agent' | 'agent-containers' | 'pod';
   agentId: string;
   pollMs: number;
   namespace?: string;
@@ -1246,9 +2531,9 @@ function liveMonitorScript(opts: {
   }
   function statusClass(st){
     var s = String(st || '');
-    if (s === 'Running' || s === 'Succeeded' || s === 'Completed') return 'ok';
-    if (/CrashLoop|ImagePull|ErrImage|OOM|Error|Failed|Evicted|BackOff/i.test(s)) return 'crit';
-    if (s === 'Pending' || s === 'ContainerCreating' || s === 'Terminating') return 'warn';
+    if (s === 'Running' || s === 'Succeeded' || s === 'Completed' || s === 'running') return 'ok';
+    if (/CrashLoop|ImagePull|ErrImage|OOM|Error|Failed|Evicted|BackOff|exited|dead|unhealthy/i.test(s)) return 'crit';
+    if (s === 'Pending' || s === 'ContainerCreating' || s === 'Terminating' || s === 'restarting') return 'warn';
     return 'off';
   }
   function setText(id, text){
@@ -1267,9 +2552,49 @@ function liveMonitorScript(opts: {
       var res = await fetch('/dashboard/agents/' + encodeURIComponent(cfg.agentId) + '/live', {cache:'no-store'});
       if (!res.ok) return;
       var data = await res.json();
-      if (data.podInventoryAt) setText('live-inventory-at', new Date(data.podInventoryAt).toISOString());
+      var inventoryAt = data.containerInventoryAt || data.podInventoryAt;
+      if (inventoryAt) setText('live-inventory-at', new Date(inventoryAt).toISOString());
       if (data.lastHeartbeatAt) setText('live-heartbeat', new Date(data.lastHeartbeatAt).toISOString());
       if (data.status) setHtml('live-agent-status', badge(data.status));
+      if (cfg.mode === 'agent-containers') {
+        var containers = Array.isArray(data.containers) ? data.containers : [];
+        setText('live-container-count', String(containers.length));
+        var ctbody = document.querySelector('#live-container-table tbody');
+        if (!ctbody) return;
+        var cseen = {};
+        containers.forEach(function(c){
+          var key = c.name || '';
+          if (!key) return;
+          cseen[key] = true;
+          var row = ctbody.querySelector('tr[data-container-key="' + key.replace(/"/g,'') + '"]');
+          if (!row) {
+            var tr = document.createElement('tr');
+            tr.setAttribute('data-container-key', key);
+            tr.innerHTML =
+              '<td><code>' + esc(key) + '</code></td>' +
+              '<td data-f="service">' + esc(c.service || '—') + '</td>' +
+              '<td data-f="status">' + badge(c.status) + '</td>' +
+              '<td data-f="health">' + esc(c.health || '—') + '</td>' +
+              '<td data-f="restarts">' + esc(c.restarts == null ? 0 : c.restarts) + '</td>' +
+              '<td data-f="image"><code>' + esc(c.image || '—') + '</code></td>' +
+              '<td data-f="age">' + esc(c.age || '—') + '</td>';
+            ctbody.appendChild(tr);
+            return;
+          }
+          var st = row.querySelector('[data-f="status"]');
+          if (st) st.innerHTML = badge(c.status);
+          var svc = row.querySelector('[data-f="service"]'); if (svc) svc.textContent = c.service || '—';
+          var h = row.querySelector('[data-f="health"]'); if (h) h.textContent = c.health || '—';
+          var rs = row.querySelector('[data-f="restarts"]'); if (rs) rs.textContent = String(c.restarts == null ? 0 : c.restarts);
+          var img = row.querySelector('[data-f="image"]'); if (img) img.innerHTML = '<code>' + esc(c.image || '—') + '</code>';
+          var a = row.querySelector('[data-f="age"]'); if (a) a.textContent = c.age || '—';
+        });
+        Array.prototype.slice.call(ctbody.querySelectorAll('tr[data-container-key]')).forEach(function(row){
+          var k = row.getAttribute('data-container-key');
+          if (k && !cseen[k]) row.remove();
+        });
+        return;
+      }
       var pods = Array.isArray(data.pods) ? data.pods : [];
       if (cfg.mode === 'agent') {
         setText('live-pod-count', String(pods.length));
@@ -1333,6 +2658,117 @@ function liveMonitorScript(opts: {
   setInterval(tick, cfg.pollMs || 3000);
 })();
 </script>`;
+}
+
+function renderCategoryTabs(
+  active: DashboardCategoryTab,
+  counts: Record<DashboardCategoryTab, number>,
+): string {
+  const tabs: DashboardCategoryTab[] = [
+    'all',
+    'pod',
+    'deployment',
+    'docker',
+  ];
+  if (counts.replicaset > 0) tabs.push('replicaset');
+  if (counts.other > 0) tabs.push('other');
+
+  return `<div class="source-tabs">${tabs
+    .map((id) => {
+      const href = id === 'all' ? '/dashboard' : `/dashboard?category=${id}`;
+      const cls = active === id ? 'tab active' : 'tab';
+      return `<a class="${cls}" href="${href}">${esc(categoryTabLabel(id))} <span class="tab-count">${counts[id]}</span></a>`;
+    })
+    .join('')}</div>`;
+}
+
+function dashboardCategoryHint(category: DashboardCategoryTab): string {
+  switch (category) {
+    case 'pod':
+      return 'Live pod failures (CrashLoopBackOff, OOM, image pull, etc.) on pods still in agent inventory.';
+    case 'deployment':
+      return 'Live deployment-level failures on deployments still failing in agent inventory.';
+    case 'docker':
+      return 'Live Docker container failures (exited, unhealthy, restart loop, OOM) still in container inventory.';
+    case 'replicaset':
+      return 'Live ReplicaSet failures still tied to failing workload inventory.';
+    case 'other':
+      return 'Live failures on other resource kinds.';
+    default:
+      return 'All live failures grouped by resource kind — pods, deployments, Docker containers, and more. Only resources still failing in the latest inventory are shown.';
+  }
+}
+
+function dashboardEmptyMessage(category: DashboardCategoryTab): string {
+  switch (category) {
+    case 'pod':
+      return 'No live pod failures in inventory.';
+    case 'deployment':
+      return 'No live deployment failures in inventory.';
+    case 'docker':
+      return 'No live Docker container failures in inventory.';
+    case 'replicaset':
+      return 'No live ReplicaSet failures in inventory.';
+    case 'other':
+      return 'No live failures on other resource kinds.';
+    default:
+      return 'No live failures across any resource kind.';
+  }
+}
+
+function incidentLocationCell(g: IncidentGroup): string {
+  if (inferIncidentCategory(g.latest) === 'docker') {
+    const meta = (g.latest.metadata ?? {}) as Record<string, string>;
+    return esc(meta.host || '—');
+  }
+  return esc(g.namespace);
+}
+
+function renderDashboardIncidentRows(
+  groups: IncidentGroup[],
+  incidentsService: IncidentsService,
+): string {
+  return groups
+    .map((g) => {
+      const i = g.latest;
+      const cause = formatCause(i.metadata, i.reason);
+      const fix = incidentsService.displaySuggestedFix(
+        i.suggestedFix,
+        i.severity,
+      );
+      const hasSnap = i.snapshot != null;
+      const target = resolveDeploymentTarget(i);
+      let actionCell = '<span class="muted">—</span>';
+      if (target.deployment || isDockerContainerIncident(i)) {
+        actionCell = askAgentButton(i.id);
+      } else if (incidentsService.suggestionAction(i) === 'view') {
+        actionCell = `<a class="btn autofix-btn" href="/dashboard/incidents/${esc(i.id)}/suggestion">View suggestion</a>`;
+      }
+      const countBadge =
+        g.count > 1
+          ? `<span class="badge off" title="Repeated detections of the same issue">×${g.count}</span>`
+          : `<span class="muted">1</span>`;
+      return `
+      <tr>
+        <td class="autofix-col">${actionCell}</td>
+        <td>${esc(g.lastSeenAt.toISOString())}</td>
+        <td>${countBadge}</td>
+        <td><span class="badge ${severityClass(i.severity)}">${esc(i.severity)}</span></td>
+        <td>${esc(g.type)}</td>
+        <td class="cause"><code>${esc(cause)}</code></td>
+        <td class="fix">${fix ? esc(fix) : '<span class="muted">—</span>'}</td>
+        <td><code>${esc(g.resource)}</code></td>
+        <td>${incidentLocationCell(g)}</td>
+        <td>${esc(g.clusterName)}</td>
+        <td><a href="/dashboard/incidents/${esc(i.id)}">${hasSnap ? 'Snapshot' : 'Detail'}</a></td>
+      </tr>`;
+    })
+    .join('');
+}
+
+function agentMode(agent: { labels?: unknown }): 'docker-host' | 'kubernetes' {
+  const labels = (agent.labels ?? {}) as Record<string, string>;
+  return labels.agentType === 'docker-host' ? 'docker-host' : 'kubernetes';
 }
 
 function esc(value: unknown): string {

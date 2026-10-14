@@ -7,6 +7,11 @@ export const APPLY_FIX_TYPES = new Set([
   'OOMKilled',
   'ImagePullBackOff',
   'DeploymentUnhealthy',
+  'CrashLoopBackOff',
+  'CreateContainerConfigError',
+  'CreateContainerError',
+  'InvalidImageName',
+  'KubernetesWarning',
 ]);
 
 export const MEMORY_PRESETS = ['256Mi', '512Mi', '1Gi', '2Gi'] as const;
@@ -17,6 +22,7 @@ const IMAGE_RE = /^[a-z0-9._\-\/:@+]+$/i;
 export type AutoFixIncident = {
   type?: string | null;
   reason?: string | null;
+  message?: string | null;
   namespace?: string | null;
   resource?: string | null;
   suggestedFix?: string | null;
@@ -370,10 +376,36 @@ export type AgentFixPlan = {
     | 'set_deployment_memory'
     | 'set_deployment_image'
     | 'restart_deployment'
-    | 'scale_deployment';
+    | 'scale_deployment'
+    | 'restart_container'
+    | 'set_container_image';
   params: Record<string, string>;
   summary: string;
 };
+
+export function resolveContainerTarget(incident: AutoFixIncident): {
+  host: string;
+  container: string;
+  service: string;
+} | null {
+  const resource = (incident.resource || '').trim();
+  const slash = resource.indexOf('/');
+  if (slash <= 0 || resource.slice(0, slash).toLowerCase() !== 'container') {
+    return null;
+  }
+  const name = resource.slice(slash + 1).trim();
+  if (!name) return null;
+  const meta = asMeta(incident.metadata);
+  return {
+    host: String(meta.host || '—').trim() || '—',
+    container: name,
+    service: String(meta.service || name).trim() || name,
+  };
+}
+
+export function isDockerContainerIncident(incident: AutoFixIncident): boolean {
+  return resolveContainerTarget(incident) != null;
+}
 
 /** Build an allowlisted agent op from user-chosen form values. */
 export function buildAgentFixPlan(
@@ -387,60 +419,86 @@ export function buildAgentFixPlan(
     replicas?: string;
   },
 ): AgentFixPlan {
-  const action = getSuggestionAction(incident);
-  if (action !== 'apply') {
-    throw new Error('Incident is not eligible for agent apply');
+  const containerTarget = resolveContainerTarget(incident);
+  const deployAction = (input.deployAction || '').trim();
+  const image = (input.image || '').trim();
+
+  if (containerTarget) {
+    const container = containerTarget.container;
+    if (deployAction === 'restart') {
+      return {
+        type: 'restart_container',
+        params: { container },
+        summary: `Restart Docker container ${container} on ${containerTarget.host}`,
+      };
+    }
+    if (image) {
+      if (!isValidImageRef(image)) throw new Error('Invalid image reference');
+      return {
+        type: 'set_container_image',
+        params: { container, image },
+        summary: `Recreate Docker container ${container} with image=${image}`,
+      };
+    }
+    throw new Error('Choose restart or set a new image');
   }
+
   const target = resolveDeploymentTarget(incident);
   if (!target.deployment) {
     throw new Error('Could not resolve deployment name');
   }
-  const type = (incident.type || '').trim();
-
-  if (type === 'DeploymentUnhealthy') {
-    const deployAction = (input.deployAction || '').trim();
-    if (deployAction === 'restart') {
-      return {
-        type: 'restart_deployment',
-        params: {
-          namespace: target.namespace,
-          deployment: target.deployment,
-        },
-        summary: `Restart deployment ${target.namespace}/${target.deployment}`,
-      };
+  if (deployAction === 'restart') {
+    return {
+      type: 'restart_deployment',
+      params: {
+        namespace: target.namespace,
+        deployment: target.deployment,
+      },
+      summary: `Restart deployment ${target.namespace}/${target.deployment}`,
+    };
+  }
+  if (deployAction === 'scale') {
+    const replicas = Number((input.replicas || '').trim());
+    if (!Number.isInteger(replicas) || replicas < 0 || replicas > 50) {
+      throw new Error('Replicas must be an integer between 0 and 50');
     }
-    if (deployAction === 'scale') {
-      const replicas = Number((input.replicas || '').trim());
-      if (!Number.isInteger(replicas) || replicas < 0 || replicas > 50) {
-        throw new Error('Replicas must be an integer between 0 and 50');
-      }
-      return {
-        type: 'scale_deployment',
-        params: {
-          namespace: target.namespace,
-          deployment: target.deployment,
-          replicas: String(replicas),
-        },
-        summary: `Scale deployment ${target.namespace}/${target.deployment} to ${replicas} replicas`,
-      };
-    }
-    throw new Error('Choose an action: restart or scale');
+    return {
+      type: 'scale_deployment',
+      params: {
+        namespace: target.namespace,
+        deployment: target.deployment,
+        replicas: String(replicas),
+      },
+      summary: `Scale deployment ${target.namespace}/${target.deployment} to ${replicas} replicas`,
+    };
   }
 
   const container = (input.container || target.container || '').trim();
-  if (!container) {
-    throw new Error('Container name is required');
+  const imageInput = (input.image || '').trim();
+  const memoryLimit = (input.memoryLimit || '').trim();
+
+  if (imageInput) {
+    if (!container) throw new Error('Container name is required');
+    if (!isValidImageRef(imageInput)) throw new Error('Invalid image reference');
+    return {
+      type: 'set_deployment_image',
+      params: {
+        namespace: target.namespace,
+        deployment: target.deployment,
+        container,
+        image: imageInput,
+      },
+      summary: `Set ${target.namespace}/${target.deployment} container ${container} image=${imageInput}`,
+    };
   }
 
-  if (type === 'OOMKilled') {
-    const memoryLimit = (input.memoryLimit || '').trim();
+  if (memoryLimit) {
+    if (!container) throw new Error('Container name is required');
     if (!isValidMemoryQuantity(memoryLimit)) {
       throw new Error('Invalid memory limit (use e.g. 512Mi or 1Gi)');
     }
     let memoryRequest = (input.memoryRequest || '').trim();
-    if (!memoryRequest) {
-      memoryRequest = memoryLimit;
-    }
+    if (!memoryRequest) memoryRequest = memoryLimit;
     if (!isValidMemoryQuantity(memoryRequest)) {
       throw new Error('Invalid memory request');
     }
@@ -457,22 +515,7 @@ export function buildAgentFixPlan(
     };
   }
 
-  if (type === 'ImagePullBackOff') {
-    const image = (input.image || '').trim();
-    if (!isValidImageRef(image)) {
-      throw new Error('Invalid image reference');
-    }
-    return {
-      type: 'set_deployment_image',
-      params: {
-        namespace: target.namespace,
-        deployment: target.deployment,
-        container,
-        image,
-      },
-      summary: `Set ${target.namespace}/${target.deployment} container ${container} image=${image}`,
-    };
-  }
-
-  throw new Error(`Unsupported apply type: ${type}`);
+  throw new Error(
+    'Choose a supported action: set image, set memory, restart, or scale',
+  );
 }

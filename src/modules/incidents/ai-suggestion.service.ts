@@ -1,6 +1,16 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
+import { ClusterPrefillService } from './cluster-prefill.service';
 import { ruleSuggestFix } from './suggested-fix';
+import {
+  parseAskChatLlmJson,
+  type AskAgentSession,
+  type AskChatMessage,
+  type AskChatResult,
+  type AskStreamEvent,
+} from './ask-agent';
 
 export type IncidentForSuggestion = {
   id?: string;
@@ -16,6 +26,8 @@ export type IncidentForSuggestion = {
 
 const OPENAI_TIMEOUT_MS = 12_000;
 const CURSOR_TIMEOUT_MS = 45_000;
+/** Local Cursor+MCP chat is a full agent run; 45s was cutting off successful replies. */
+const CHAT_CURSOR_TIMEOUT_MS = 120_000;
 const BACKFILL_LIMIT = 40;
 const ENRICH_CONCURRENCY = 1;
 
@@ -26,7 +38,10 @@ export class AiSuggestionService implements OnModuleInit {
   /** Skip OpenAI until this time after 429 / billing failures. */
   private openAiCooldownUntil = 0;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cluster: ClusterPrefillService,
+  ) {}
 
   onModuleInit() {
     void this.backfillRecentMissing(BACKFILL_LIMIT);
@@ -275,6 +290,313 @@ export class AiSuggestionService implements OnModuleInit {
     });
     await this.enrichMany(rows);
     return rows.length;
+  }
+
+  /**
+   * Conversational reply for Ask agent. Cursor + OpsPilot MCP only —
+   * never a canned template, never OpenAI.
+   */
+  async chatAboutIncident(
+    session: AskAgentSession,
+    history: AskChatMessage[],
+    userMessage: string,
+  ): Promise<AskChatResult> {
+    let last: AskChatResult | null = null;
+    for await (const ev of this.streamChatAboutIncident(
+      session,
+      history,
+      userMessage,
+    )) {
+      if (ev.type === 'done') last = ev.result;
+      if (ev.type === 'error') {
+        return {
+          reply: ev.message,
+          propose: null,
+          options: [],
+        };
+      }
+    }
+    return (
+      last || {
+        reply:
+          'Cursor + OpsPilot MCP did not finish. I will not substitute a template — ask again.',
+        propose: null,
+        options: [],
+      }
+    );
+  }
+
+  /** Yields thinking / tool / final reply events for SSE. */
+  async *streamChatAboutIncident(
+    session: AskAgentSession,
+    history: AskChatMessage[],
+    userMessage: string,
+  ): AsyncGenerator<AskStreamEvent> {
+    if (!this.cursorKey()) {
+      yield {
+        type: 'error',
+        message:
+          'Ask agent is wired to Cursor + OpsPilot MCP. Set CURSOR_API_KEY and retry.',
+      };
+      return;
+    }
+    yield { type: 'status', text: 'Starting Cursor + OpsPilot MCP…' };
+    yield* this.streamViaCursor(session, history, userMessage);
+  }
+
+  private chatSystemPrompt(session: AskAgentSession): string {
+    const mcpHint = [
+      'Use OpsPilot MCP tools only. Do not read or edit workspace files. Do not run shell.',
+      session.incidentId
+        ? `Call get_incident with incidentId="${session.incidentId}".`
+        : 'Call list_incidents.',
+      session.agentId
+        ? `Call get_agent_live with agentId="${session.agentId}".`
+        : 'Call list_agents, then get_agent_live for the online agent.',
+      'Do not invent cluster state. Quote waitingMessage / Secret / image errors exactly.',
+    ].join(' ');
+    return `You are OpsPilot, a Kubernetes SRE copilot in a chat UI.
+${mcpHint}
+
+Incident facts:
+${session.facts}
+
+Allowlisted actions you MAY put on chips (nothing else):
+- set_image: change container image. Include "image":"registry/app:tag" or "needsInput":true
+- set_memory: change memory limit/request. Include "memoryLimit":"256Mi" (or 512Mi, 1Gi, 2Gi) or "needsInput":true
+- restart: rollout restart the deployment
+- scale: change replica count. Include "replicas":"2" or "needsInput":true
+
+Rules:
+- Write the entire reply yourself from MCP tool results. No canned templates.
+- Do not show chips until you have explained the problem.
+- Pick actions that match this incident. OOM → set_memory; bad image → set_image; missing Secret is not an allowlisted apply.
+- Never claim you already changed the cluster.
+- Reply as JSON only, no markdown fences:
+{"reply":"your message","options":[{"action":"set_memory","label":"Raise memory to 256Mi","detail":"…","memoryLimit":"256Mi"}],"propose":null}
+- Keep reply under 120 words.
+- If they have not agreed to apply, propose must be null.`;
+  }
+
+  private async chatViaOpenAI(
+    session: AskAgentSession,
+    history: AskChatMessage[],
+    userMessage: string,
+  ): Promise<AskChatResult | null> {
+    const apiKey = this.openAiKey()!;
+    const baseUrl = (
+      process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+    ).replace(/\/$/, '');
+    const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+    const messages: Array<{ role: string; content: string }> = [
+      { role: 'system', content: this.chatSystemPrompt(session) },
+    ];
+    for (const m of history.slice(-12)) {
+      if (m.role === 'user' || m.role === 'assistant') {
+        messages.push({ role: m.role, content: m.content.slice(0, 2000) });
+      }
+    }
+    messages.push({ role: 'user', content: userMessage.slice(0, 2000) });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20_000);
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.4,
+          max_tokens: 400,
+          messages,
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        this.logger.warn(
+          `OpenAI chat failed: ${res.status} ${errText.slice(0, 200)}`,
+        );
+        if (res.status === 429 || res.status === 402) {
+          this.openAiCooldownUntil = Date.now() + 15 * 60_000;
+        }
+        return null;
+      }
+      const json = (await res.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const content = json?.choices?.[0]?.message?.content?.trim() || '';
+      return (
+        parseAskChatLlmJson(content, session.prefill) ||
+        (content
+          ? { reply: content.slice(0, 2000), propose: null, options: [] }
+          : null)
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`OpenAI chat error: ${msg}`);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async *streamViaCursor(
+    session: AskAgentSession,
+    history: AskChatMessage[],
+    userMessage: string,
+  ): AsyncGenerator<AskStreamEvent> {
+    const apiKey = this.cursorKey()!;
+    const model =
+      process.env.CURSOR_MODEL || process.env.OPENAI_MODEL || 'composer-2.5';
+    const transcript = history
+      .slice(-8)
+      .map((m) => `${m.role}: ${m.content.slice(0, 800)}`)
+      .join('\n');
+    const prompt = `${this.chatSystemPrompt(session)}\n\nPrior chat:\n${transcript || '(none)'}\n\nOperator: ${userMessage.slice(0, 2000)}`;
+
+    const storeRoot = join(process.cwd(), '.opspilot-cursor-agents');
+    const workspace = join(storeRoot, 'workspace');
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(
+      join(workspace, 'README.md'),
+      'Empty workspace. Use OpsPilot MCP tools only. Do not read other files.\n',
+    );
+    const mcpScript = join(process.cwd(), 'mcp/opspilot-mcp.mjs');
+    const started = Date.now();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let agent: any = null;
+
+    try {
+      const { Agent, JsonlLocalAgentStore } = await import('@cursor/sdk');
+      agent = await Agent.create({
+        apiKey,
+        model: { id: model },
+        mcpServers: {
+          opspilot: {
+            command: process.execPath,
+            args: [mcpScript],
+            env: {
+              OPSPILOT_API_URL:
+                process.env.OPSPILOT_API_URL || 'http://127.0.0.1:3000',
+            },
+          },
+        },
+        local: {
+          cwd: workspace,
+          store: new JsonlLocalAgentStore(storeRoot),
+          settingSources: [],
+          sandboxOptions: { enabled: false },
+        },
+      });
+
+      const run = await agent.send(prompt);
+      let assistantText = '';
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        void run.cancel().catch(() => undefined);
+      }, CHAT_CURSOR_TIMEOUT_MS);
+
+      try {
+        for await (const event of run.stream()) {
+          if (timedOut) break;
+          if (event.type === 'thinking' && typeof event.text === 'string') {
+            const chunk = event.text.trim();
+            if (chunk) yield { type: 'thinking', text: chunk };
+          } else if (event.type === 'tool_call') {
+            const status =
+              event.status === 'completed' || event.status === 'error'
+                ? event.status
+                : 'running';
+            const args =
+              event.args && typeof event.args === 'object'
+                ? (event.args as Record<string, unknown>)
+                : {};
+            const toolName =
+              typeof args.toolName === 'string' && args.toolName
+                ? args.toolName
+                : String(event.name || 'tool');
+            yield {
+              type: 'tool',
+              name: toolName,
+              status,
+              callId:
+                typeof event.call_id === 'string' ? event.call_id : undefined,
+            };
+          } else if (event.type === 'assistant' && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === 'text' && block.text) {
+                assistantText += block.text;
+              }
+            }
+          } else if (event.type === 'status' && event.status) {
+            yield { type: 'status', text: String(event.status) };
+          }
+        }
+
+        const result = timedOut ? null : await run.wait();
+        const ms = Date.now() - started;
+        if (timedOut) {
+          this.logger.warn(`Cursor + MCP chat timed out after ${ms}ms`);
+          yield {
+            type: 'error',
+            message:
+              'Cursor + OpsPilot MCP timed out. Ask again — I will not substitute a template.',
+          };
+          return;
+        }
+        const content = String(
+          result?.result ?? assistantText ?? '',
+        ).trim();
+        if (!content) {
+          this.logger.warn(
+            `Cursor + MCP finished without text after ${ms}ms status=${result?.status}`,
+          );
+          yield {
+            type: 'error',
+            message:
+              'Cursor + OpsPilot MCP finished without a reply. Ask again.',
+          };
+          return;
+        }
+        this.logger.log(`Ask agent reply via Cursor + OpsPilot MCP in ${ms}ms`);
+        const parsed =
+          parseAskChatLlmJson(content, session.prefill) || {
+            reply: content.slice(0, 2000),
+            propose: null,
+            options: [],
+          };
+        yield {
+          type: 'done',
+          result: { ...parsed, source: 'cursor-mcp' },
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Cursor chat error: ${msg}`);
+      yield {
+        type: 'error',
+        message: `Cursor + OpsPilot MCP error: ${msg.slice(0, 300)}`,
+      };
+    } finally {
+      if (agent) {
+        try {
+          await agent[Symbol.asyncDispose]();
+        } catch {
+          try {
+            agent.close();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
   }
 }
 

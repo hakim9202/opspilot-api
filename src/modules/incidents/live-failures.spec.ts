@@ -1,7 +1,10 @@
 import {
   buildLiveFailureIndex,
+  buildLiveDockerFailureIndex,
   filterLiveFailureIncidents,
+  filterLiveDockerFailureIncidents,
   isKnownFailurePodStatus,
+  isKnownFailureContainerStatus,
 } from './live-failures';
 import type { IncidentLike } from './incident-groups';
 
@@ -126,5 +129,56 @@ describe('live-failures', () => {
       healthyOnly,
     );
     expect(kept).toHaveLength(0);
+  });
+
+  it('detects known failure container statuses', () => {
+    expect(isKnownFailureContainerStatus('exited')).toBe(true);
+    expect(isKnownFailureContainerStatus('running')).toBe(false);
+    expect(isKnownFailureContainerStatus('running', 'unhealthy')).toBe(true);
+  });
+
+  it('indexes failing docker containers', () => {
+    const idx = buildLiveDockerFailureIndex([
+      {
+        clusterName: 'docker-desktop',
+        status: 'online',
+        containerInventory: [
+          { name: 'backend', status: 'exited' },
+          { name: 'web', status: 'running' },
+        ],
+      },
+    ]);
+    expect(idx.has('docker-desktop|backend')).toBe(true);
+    expect(idx.has('docker-desktop|web')).toBe(false);
+  });
+
+  it('keeps docker incidents for failing inventoried containers', () => {
+    const agents = [
+      {
+        clusterName: 'docker-desktop',
+        status: 'online',
+        containerInventory: [{ name: 'backend', status: 'exited' }],
+      },
+    ];
+    const incidents: IncidentLike[] = [
+      {
+        id: 'd1',
+        type: 'ContainerExited',
+        severity: 'warning',
+        resource: 'container/backend',
+        occurredAt: new Date(),
+        agent: { clusterName: 'docker-desktop' },
+      },
+      {
+        id: 'd2',
+        type: 'ContainerExited',
+        severity: 'warning',
+        resource: 'container/gone',
+        occurredAt: new Date(),
+        agent: { clusterName: 'docker-desktop' },
+      },
+    ];
+    const kept = filterLiveDockerFailureIncidents(incidents, agents);
+    expect(kept.map((i) => i.id)).toEqual(['d1']);
   });
 });

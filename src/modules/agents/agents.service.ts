@@ -117,6 +117,23 @@ export class AgentsService {
       data.podInventoryAt = new Date();
     }
 
+    if (Array.isArray(dto.containers)) {
+      const containers = dto.containers
+        .filter((c) => c && c.name)
+        .slice(0, 500)
+        .map((c) => ({
+          name: String(c.name),
+          status: String(c.status || 'Unknown'),
+          health: c.health != null && String(c.health).trim() ? String(c.health) : undefined,
+          restarts: Number.isFinite(Number(c.restarts)) ? Number(c.restarts) : 0,
+          age: String(c.age || ''),
+          image: c.image != null && String(c.image).trim() ? String(c.image) : undefined,
+          service: c.service != null && String(c.service).trim() ? String(c.service) : undefined,
+        }));
+      data.containerInventory = containers;
+      data.containerInventoryAt = new Date();
+    }
+
     await this.prisma.agent.update({
       where: { id: agentId },
       data: data as any,
@@ -232,6 +249,8 @@ export class AgentsService {
         labels: true,
         podInventory: true,
         podInventoryAt: true,
+        containerInventory: true,
+        containerInventoryAt: true,
       },
     });
 
@@ -265,6 +284,8 @@ export class AgentsService {
         labels: true,
         podInventory: true,
         podInventoryAt: true,
+        containerInventory: true,
+        containerInventoryAt: true,
       },
     });
     if (!agent) {

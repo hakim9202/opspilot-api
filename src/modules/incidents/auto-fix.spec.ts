@@ -40,14 +40,14 @@ describe('auto-fix', () => {
       ).toBe('apply');
     });
 
-    it('returns view for CrashLoop advice (not silent apply)', () => {
+    it('returns apply for CrashLoopBackOff with deployment target + suggestion', () => {
       expect(
         getSuggestionAction({
           type: 'CrashLoopBackOff',
           resource: 'pod/demo-exit2-58dd656bcd-vsd69',
           suggestedFix: 'Check DB connectivity from the pod.',
         }),
-      ).toBe('view');
+      ).toBe('apply');
     });
 
     it('returns view for KubernetesWarning when suggestion exists', () => {
@@ -245,6 +245,45 @@ describe('auto-fix', () => {
       );
       expect(plan.type).toBe('scale_deployment');
       expect(plan.params.replicas).toBe('2');
+    });
+
+    it('builds set_deployment_memory when LLM chooses memory on CrashLoop', () => {
+      const plan = buildAgentFixPlan(
+        {
+          type: 'CrashLoopBackOff',
+          namespace: 'opspilot-demo',
+          resource: 'deployment/demo-healthy-b',
+          suggestedFix: 'Process keeps dying',
+        },
+        { memoryLimit: '256Mi', container: 'app' },
+      );
+      expect(plan.type).toBe('set_deployment_memory');
+    });
+
+    it('builds restart_container for docker incidents', () => {
+      const plan = buildAgentFixPlan(
+        {
+          type: 'ContainerExited',
+          resource: 'container/backend',
+          metadata: { host: 'mac', source: 'docker' },
+        },
+        { deployAction: 'restart' },
+      );
+      expect(plan.type).toBe('restart_container');
+      expect(plan.params.container).toBe('backend');
+    });
+
+    it('builds set_container_image for docker incidents', () => {
+      const plan = buildAgentFixPlan(
+        {
+          type: 'ContainerExited',
+          resource: 'container/backend',
+          metadata: { host: 'mac', source: 'docker' },
+        },
+        { image: 'my-backend:1.0' },
+      );
+      expect(plan.type).toBe('set_container_image');
+      expect(plan.params.image).toBe('my-backend:1.0');
     });
   });
 });

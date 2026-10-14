@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { inspectKubernetesWorkload } from './cluster-evidence';
 
 const execFileAsync = promisify(execFile);
 
@@ -90,5 +91,9 @@ export class ClusterPrefillService {
       this.logger.debug(`cluster prefill skipped: ${msg}`);
       return null;
     }
+  }
+
+  async inspectWorkload(namespace: string, deployment: string): Promise<string> {
+    return inspectKubernetesWorkload(namespace, deployment);
   }
 }

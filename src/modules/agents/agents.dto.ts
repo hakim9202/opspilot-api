@@ -18,9 +18,20 @@ export class PodInventoryItemDto {
   memory?: string;
 }
 
+export class ContainerInventoryItemDto {
+  name!: string;
+  status!: string;
+  health?: string;
+  restarts!: number;
+  age!: string;
+  image?: string;
+  service?: string;
+}
+
 export class HeartbeatDto {
   status!: string;
   version!: string;
   meta?: Record<string, string>;
   pods?: PodInventoryItemDto[];
+  containers?: ContainerInventoryItemDto[];
 }
